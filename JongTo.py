@@ -19,8 +19,13 @@ st.set_page_config(
 # ------------------------------------------------------------
 
 NAVER_BOARD_URL = "https://finance.naver.com/item/board.naver"
+
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MarketSentimentMVP/0.1; +https://example.com)",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
@@ -39,12 +44,14 @@ POSITIVE_WORDS = [
     "상한가", "급등", "간다", "가즈아", "매수", "호재", "돌파", "신고가", "반등", "대박",
     "상승", "불장", "기대", "저평가", "수급", "실적", "목표가", "외국인", "기관", "강세",
     "랠리", "회복", "성장", "수혜", "흑자", "계약", "수주", "좋다", "버틴다", "추세",
+    "날아", "올라", "오른다", "매집", "추매", "바닥", "턴어라운드", "기회", "상방",
 ]
 
 NEGATIVE_WORDS = [
     "폭락", "하락", "손절", "물렸다", "물림", "악재", "끝났다", "망했다", "팔아라", "개미지옥",
     "떡락", "하방", "실망", "폭망", "고점", "과열", "조정", "매도", "부진", "적자",
     "리스크", "불안", "급락", "던져", "털림", "횡보", "매물", "약세", "위험", "거품",
+    "물타기", "물렸", "빠진다", "내린다", "손실", "시체", "나락", "답없", "망함",
 ]
 
 MOCK_STOCKS = {
@@ -59,13 +66,58 @@ MOCK_STOCKS = {
         "message_volume": 184,
         "hype_index": 76,
         "updated_at": "오늘 14:35",
-        "positive_keywords": {"반등": 92, "실적": 78, "외국인": 65, "매수": 61, "HBM": 55, "저평가": 42},
-        "negative_keywords": {"횡보": 68, "물림": 48, "매도": 39, "실망": 34, "하락": 31},
+        "positive_keywords": {
+            "반등": 92,
+            "실적": 78,
+            "외국인": 65,
+            "매수": 61,
+            "HBM": 55,
+            "저평가": 42,
+        },
+        "negative_keywords": {
+            "횡보": 68,
+            "물림": 48,
+            "매도": 39,
+            "실망": 34,
+            "하락": 31,
+        },
         "posts": [
-            {"title": "외국인 다시 들어오는 분위기네요", "sentiment": "긍정", "views": 482, "likes": 11, "dislikes": 2},
-            {"title": "오늘 거래량 보면 단기 반등 가능성 있음", "sentiment": "긍정", "views": 331, "likes": 8, "dislikes": 1},
-            {"title": "또 박스권이면 힘들다", "sentiment": "부정", "views": 298, "likes": 4, "dislikes": 7},
-            {"title": "실적 발표 전까지는 관망", "sentiment": "중립", "views": 211, "likes": 2, "dislikes": 1},
+            {
+                "title": "외국인 다시 들어오는 분위기네요",
+                "sentiment": "긍정",
+                "views": 482,
+                "likes": 11,
+                "dislikes": 2,
+                "date": "-",
+                "url": "",
+            },
+            {
+                "title": "오늘 거래량 보면 단기 반등 가능성 있음",
+                "sentiment": "긍정",
+                "views": 331,
+                "likes": 8,
+                "dislikes": 1,
+                "date": "-",
+                "url": "",
+            },
+            {
+                "title": "또 박스권이면 힘들다",
+                "sentiment": "부정",
+                "views": 298,
+                "likes": 4,
+                "dislikes": 7,
+                "date": "-",
+                "url": "",
+            },
+            {
+                "title": "실적 발표 전까지는 관망",
+                "sentiment": "중립",
+                "views": 211,
+                "likes": 2,
+                "dislikes": 1,
+                "date": "-",
+                "url": "",
+            },
         ],
     }
 }
@@ -79,9 +131,25 @@ def to_int(value: Any) -> int:
     return int(text) if text.isdigit() else 0
 
 
+def decode_naver_html(content: bytes) -> str:
+    """
+    네이버 금융은 cp949/euc-kr 계열 인코딩을 쓰는 경우가 많습니다.
+    Render 환경에서 response.text에 맡기면 한글이 깨질 수 있어 직접 디코딩합니다.
+    """
+    for encoding in ["cp949", "euc-kr", "utf-8"]:
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return content.decode("cp949", errors="replace")
+
+
 def clean_title(title: str) -> str:
-    title = re.sub(r"\s+", " ", str(title)).strip()
-    title = title.replace("답글", "").strip()
+    title = str(title)
+    title = title.replace("\xa0", " ")
+    title = title.replace("답글", "")
+    title = re.sub(r"\s+", " ", title).strip()
     return title
 
 
@@ -95,9 +163,10 @@ def fetch_naver_board_first_page(stock_code: str) -> pd.DataFrame:
         timeout=10,
     )
     response.raise_for_status()
-    response.encoding = "euc-kr"
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    html = decode_naver_html(response.content)
+    soup = BeautifulSoup(html, "html.parser")
+
     rows: list[dict[str, Any]] = []
 
     for tr in soup.select("table.type2 tr"):
@@ -106,17 +175,30 @@ def fetch_naver_board_first_page(stock_code: str) -> pd.DataFrame:
             continue
 
         cols = [td.get_text(" ", strip=True) for td in tds]
-        date_text, title, author, views, likes, dislikes = cols[:6]
+        date_text = cols[0]
 
         # 실제 게시글 행만 통과시킵니다. 예: 2026.05.27 14:35
         if not re.match(r"^\d{4}\.\d{2}\.\d{2}", date_text):
             continue
 
+        link_tag = tr.select_one("a")
+
+        # 제목은 td 전체 텍스트보다 a 태그 텍스트를 우선 사용합니다.
+        # 그래야 아이콘, 답글 표시, 여분 텍스트가 덜 섞입니다.
+        if link_tag:
+            title = link_tag.get_text(" ", strip=True)
+        else:
+            title = cols[1]
+
         title = clean_title(title)
         if not title:
             continue
 
-        link_tag = tr.select_one("a")
+        author = cols[2] if len(cols) > 2 else ""
+        views = cols[3] if len(cols) > 3 else "0"
+        likes = cols[4] if len(cols) > 4 else "0"
+        dislikes = cols[5] if len(cols) > 5 else "0"
+
         post_url = ""
         if link_tag and link_tag.get("href"):
             post_url = "https://finance.naver.com" + link_tag["href"]
@@ -142,6 +224,7 @@ def fetch_naver_board_first_page(stock_code: str) -> pd.DataFrame:
 
 def classify_sentiment(text: str) -> str:
     text = str(text)
+
     positive_hits = sum(1 for word in POSITIVE_WORDS if word in text)
     negative_hits = sum(1 for word in NEGATIVE_WORDS if word in text)
 
@@ -160,30 +243,44 @@ def sentiment_to_score(label: str) -> int:
     return 0
 
 
-def extract_keywords(posts_df: pd.DataFrame, sentiment_label: str, vocabulary: list[str]) -> dict[str, int]:
+def extract_keywords(
+    posts_df: pd.DataFrame,
+    sentiment_label: str,
+    vocabulary: list[str],
+) -> dict[str, int]:
     if posts_df.empty:
         return {}
 
     filtered = posts_df[posts_df["sentiment"] == sentiment_label]
+    if filtered.empty:
+        return {}
+
     result: dict[str, int] = {}
 
     for word in vocabulary:
-        count = filtered["title"].astype(str).str.contains(re.escape(word), regex=True).sum()
+        mask = filtered["title"].astype(str).str.contains(re.escape(word), regex=True)
+        count = int(mask.sum())
+
         if count > 0:
-            # 조회수 영향도 약간 반영
-            matched_views = filtered[filtered["title"].astype(str).str.contains(re.escape(word), regex=True)]["views"].sum()
+            matched_views = filtered[mask]["views"].sum()
             result[word] = int(count * 20 + math.log1p(matched_views) * 10)
 
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True)[:10])
 
 
-def build_stock_summary(stock_code: str, stock_name: str, posts_df: pd.DataFrame) -> dict[str, Any]:
+def build_stock_summary(
+    stock_code: str,
+    stock_name: str,
+    posts_df: pd.DataFrame,
+) -> dict[str, Any]:
     if posts_df.empty:
         raise ValueError("수집된 게시글이 없습니다.")
 
     df = posts_df.copy()
+
     df["sentiment"] = df["title"].apply(classify_sentiment)
     df["sentiment_value"] = df["sentiment"].apply(sentiment_to_score)
+
     df["weight"] = (
         1
         + df["views"].fillna(0).apply(lambda x: math.log1p(max(x, 0)))
@@ -192,7 +289,12 @@ def build_stock_summary(stock_code: str, stock_name: str, posts_df: pd.DataFrame
     ).clip(lower=0.2)
 
     total_weight = df["weight"].sum()
-    sentiment_score = 0.0 if total_weight == 0 else float((df["sentiment_value"] * df["weight"]).sum() / total_weight)
+    if total_weight == 0:
+        sentiment_score = 0.0
+    else:
+        sentiment_score = float(
+            (df["sentiment_value"] * df["weight"]).sum() / total_weight
+        )
 
     message_volume = len(df)
     bullish_ratio = round((df["sentiment"] == "긍정").mean() * 100)
@@ -201,9 +303,19 @@ def build_stock_summary(stock_code: str, stock_name: str, posts_df: pd.DataFrame
 
     avg_views = df["views"].mean() if message_volume else 0
     total_engagement = df["likes"].sum() + df["dislikes"].sum()
-    hype_index = min(100, round(message_volume * 3 + math.log1p(avg_views) * 8 + total_engagement * 0.4))
 
-    posts = df[["title", "sentiment", "views", "likes", "dislikes", "date", "url"]].head(20).to_dict("records")
+    hype_index = min(
+        100,
+        round(
+            message_volume * 3
+            + math.log1p(avg_views) * 8
+            + total_engagement * 0.4
+        ),
+    )
+
+    posts = df[
+        ["title", "sentiment", "views", "likes", "dislikes", "date", "url"]
+    ].head(20).to_dict("records")
 
     return {
         "name": stock_name,
@@ -232,9 +344,12 @@ def get_sentiment_label(score: float) -> str:
 
 
 def keyword_dataframe(keyword_dict: dict[str, int]) -> pd.DataFrame:
+    if not keyword_dict:
+        return pd.DataFrame(columns=["keyword", "weight"])
+
     return pd.DataFrame(
         [{"keyword": key, "weight": value} for key, value in keyword_dict.items()]
-    ).sort_values("weight", ascending=False) if keyword_dict else pd.DataFrame(columns=["keyword", "weight"])
+    ).sort_values("weight", ascending=False)
 
 
 def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
@@ -243,7 +358,9 @@ def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
         return
 
     max_weight = max(keyword_dict.values())
+
     html = "<div style='display:flex;flex-wrap:wrap;gap:8px;'>"
+
     for word, weight in sorted(keyword_dict.items(), key=lambda x: x[1], reverse=True):
         size = 13 + math.floor((weight / max_weight) * 9)
         html += (
@@ -256,6 +373,7 @@ def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
             f"#{word}"
             "</span>"
         )
+
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
@@ -298,6 +416,7 @@ with st.sidebar:
 
 stock_code = re.sub(r"\D", "", stock_code)[:6] or "005930"
 stock_name = find_stock_name(stock_code)
+
 data_source = "mock"
 load_error = None
 
@@ -317,7 +436,10 @@ else:
 # ------------------------------------------------------------
 
 st.title("📈 종목토론방 실시간 여론 대시보드")
-st.caption("네이버 종목토론방의 최신 게시글 제목을 기반으로 오늘의 커뮤니티 감성지수와 과열도를 추정합니다.")
+st.caption(
+    "네이버 종목토론방의 최신 게시글 제목을 기반으로 "
+    "오늘의 커뮤니티 감성지수와 과열도를 추정합니다."
+)
 
 if data_source == "live":
     st.success("실제 네이버 종목토론방 첫 페이지 데이터를 수집해 표시 중입니다.")
@@ -330,7 +452,11 @@ header_left, header_right = st.columns([2, 1])
 
 with header_left:
     st.subheader(f"{stock['name']} · {stock_code}")
-    st.write(f"현재가 **{stock['price']}원** · 등락률 **{stock['change']}** · 업데이트 **{stock['updated_at']}**")
+    st.write(
+        f"현재가 **{stock['price']}원** · "
+        f"등락률 **{stock['change']}** · "
+        f"업데이트 **{stock['updated_at']}**"
+    )
 
 with header_right:
     label = get_sentiment_label(stock["sentiment_score"])
@@ -343,10 +469,30 @@ with header_right:
 st.divider()
 
 metric_cols = st.columns(4)
-metric_cols[0].metric("긍정 비율", f"{stock['bullish_ratio']}%", f"부정 {stock['bearish_ratio']}%")
-metric_cols[1].metric("게시글 수", f"{stock['message_volume']:,}", "첫 페이지 기준")
-metric_cols[2].metric("과열도", f"{stock['hype_index']}", "글 수·조회수·추천수")
-metric_cols[3].metric("감성 점수", f"{stock['sentiment_score']:+.2f}", "-1 ~ +1")
+
+metric_cols[0].metric(
+    "긍정 비율",
+    f"{stock['bullish_ratio']}%",
+    f"부정 {stock['bearish_ratio']}%",
+)
+
+metric_cols[1].metric(
+    "게시글 수",
+    f"{stock['message_volume']:,}",
+    "첫 페이지 기준",
+)
+
+metric_cols[2].metric(
+    "과열도",
+    f"{stock['hype_index']}",
+    "글 수·조회수·추천수",
+)
+
+metric_cols[3].metric(
+    "감성 점수",
+    f"{stock['sentiment_score']:+.2f}",
+    "-1 ~ +1",
+)
 
 # ------------------------------------------------------------
 # 7) Charts
@@ -356,6 +502,7 @@ chart_col_1, chart_col_2 = st.columns([1, 1])
 
 with chart_col_1:
     st.subheader("감성 비율")
+
     ratio_df = pd.DataFrame(
         {
             "sentiment": ["긍정", "부정", "중립"],
@@ -366,10 +513,12 @@ with chart_col_1:
             ],
         }
     )
+
     st.bar_chart(ratio_df, x="sentiment", y="ratio")
 
 with chart_col_2:
     st.subheader("키워드 가중치")
+
     positive_df = keyword_dataframe(stock["positive_keywords"])
     negative_df = keyword_dataframe(stock["negative_keywords"])
 
@@ -380,6 +529,7 @@ with chart_col_2:
         ],
         ignore_index=True,
     )
+
     st.dataframe(keyword_df, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
@@ -399,6 +549,7 @@ with keyword_col_2:
 st.divider()
 
 st.subheader("최근 대표 글 제목")
+
 posts_df = pd.DataFrame(stock["posts"])
 
 if "url" in posts_df.columns:
