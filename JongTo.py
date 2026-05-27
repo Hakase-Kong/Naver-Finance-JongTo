@@ -1,7 +1,10 @@
+import json
 import math
+import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -9,6 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from openai import OpenAI
 
 st.set_page_config(
     page_title="종목토론방 감성 대시보드",
@@ -32,6 +36,9 @@ REQUEST_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 STOCK_PRESETS = {
     "005930": "삼성전자",
     "000660": "SK하이닉스",
@@ -43,22 +50,6 @@ STOCK_PRESETS = {
     "373220": "LG에너지솔루션",
 }
 
-POSITIVE_WORDS = [
-    "상한가", "급등", "간다", "가즈아", "매수", "호재", "돌파", "신고가", "반등", "대박",
-    "상승", "불장", "기대", "저평가", "수급", "실적", "목표가", "외국인", "기관", "강세",
-    "랠리", "회복", "성장", "수혜", "흑자", "계약", "수주", "좋다", "버틴다", "추세",
-    "날아", "올라", "오른다", "오름", "매집", "추매", "바닥", "턴어라운드", "기회", "상방",
-    "대박", "좋네", "좋음", "갈듯", "간다", "쏜다", "양봉", "익절", "돌파", "강력",
-]
-
-NEGATIVE_WORDS = [
-    "폭락", "하락", "손절", "물렸다", "물림", "악재", "끝났다", "망했다", "팔아라", "개미지옥",
-    "떡락", "하방", "실망", "폭망", "고점", "과열", "조정", "매도", "부진", "적자",
-    "리스크", "불안", "급락", "던져", "털림", "횡보", "매물", "약세", "위험", "거품",
-    "물타기", "물렸", "빠진다", "내린다", "손실", "시체", "나락", "답없", "망함",
-    "음봉", "하따", "물량", "개미무덤", "폭망", "폭탄", "손절", "탈출", "지옥",
-]
-
 STOPWORDS = {
     "그리고", "그러나", "그래서", "하지만", "오늘", "내일", "어제", "지금", "진짜", "정말",
     "너무", "매우", "계속", "그냥", "아직", "다시", "이번", "저번", "이제", "여기",
@@ -69,12 +60,44 @@ STOPWORDS = {
     "삼성전자", "하이닉스", "네이버", "카카오", "현대차", "LG화학", "셀트리온",
 }
 
+# LLM 실패 시에만 쓰는 최소 백업 룰입니다.
+FALLBACK_POSITIVE_WORDS = [
+    "상한가", "급등", "간다", "가즈아", "매수", "호재", "돌파", "신고가", "반등", "대박",
+    "상승", "기대", "저평가", "수급", "실적", "목표가", "외국인", "기관", "강세",
+    "회복", "성장", "수혜", "흑자", "계약", "수주", "좋다", "추세", "상방",
+]
+
+FALLBACK_NEGATIVE_WORDS = [
+    "폭락", "하락", "손절", "물렸다", "물림", "악재", "끝났다", "망했다", "팔아라",
+    "떡락", "하방", "실망", "폭망", "고점", "과열", "조정", "매도", "부진", "적자",
+    "리스크", "불안", "급락", "던져", "털림", "횡보", "매물", "약세", "위험", "거품",
+]
+
+SENTIMENT_SCORE_MAP = {
+    "bullish": 1.0,
+    "bearish": -1.0,
+    "neutral": 0.0,
+    "sarcastic": -0.25,
+    "spam": 0.0,
+    "unknown": 0.0,
+}
+
+KOREAN_LABEL_MAP = {
+    "bullish": "긍정",
+    "bearish": "부정",
+    "neutral": "중립",
+    "sarcastic": "조롱/반어",
+    "spam": "스팸",
+    "unknown": "불확실",
+}
+
 MOCK_STOCK = {
     "name": "삼성전자",
     "price": "74,200",
     "change": "+1.23%",
     "change_text": "상승 1.23%",
     "sentiment_score": 0.42,
+    "post_sentiment_score": 0.42,
     "bullish_ratio": 58,
     "bearish_ratio": 24,
     "neutral_ratio": 18,
@@ -82,39 +105,36 @@ MOCK_STOCK = {
     "hype_index": 76,
     "updated_at": "오늘 14:35",
     "top_keywords": [
-        {"keyword": "반등", "count": 12, "score": 92, "sentiment": "긍정"},
+        {"keyword": "반등", "count": 12, "score": 92, "sentiment": "관심"},
         {"keyword": "실적", "count": 9, "score": 78, "sentiment": "관심"},
         {"keyword": "외국인", "count": 7, "score": 65, "sentiment": "관심"},
-        {"keyword": "매수", "count": 6, "score": 61, "sentiment": "긍정"},
-        {"keyword": "횡보", "count": 4, "score": 48, "sentiment": "부정"},
     ],
     "posts": [
         {
             "title": "외국인 다시 들어오는 분위기네요",
             "sentiment": "긍정",
+            "sentiment_code": "bullish",
+            "confidence": 0.9,
+            "reason": "수급 개선 기대",
             "views": 482,
             "likes": 11,
             "dislikes": 2,
             "date": "-",
             "url": "",
-        },
-        {
-            "title": "오늘 거래량 보면 단기 반등 가능성 있음",
-            "sentiment": "긍정",
-            "views": 331,
-            "likes": 8,
-            "dislikes": 1,
-            "date": "-",
-            "url": "",
+            "page": 1,
         },
         {
             "title": "또 박스권이면 힘들다",
             "sentiment": "부정",
+            "sentiment_code": "bearish",
+            "confidence": 0.82,
+            "reason": "상승 제한 우려",
             "views": 298,
             "likes": 4,
             "dislikes": 7,
             "date": "-",
             "url": "",
+            "page": 1,
         },
     ],
 }
@@ -134,7 +154,6 @@ def decode_naver_html(content: bytes) -> str:
             return content.decode(encoding)
         except UnicodeDecodeError:
             continue
-
     return content.decode("cp949", errors="replace")
 
 
@@ -241,7 +260,6 @@ def fetch_stock_price(stock_code: str) -> dict[str, str]:
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_naver_board_pages(stock_code: str, max_pages: int = 3) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-
     max_pages = max(1, min(int(max_pages), 5))
 
     for page in range(1, max_pages + 1):
@@ -268,21 +286,11 @@ def fetch_naver_board_pages(stock_code: str, max_pages: int = 3) -> pd.DataFrame
                 continue
 
             link_tag = tr.select_one("a")
-
-            if link_tag:
-                title = link_tag.get_text(" ", strip=True)
-            else:
-                title = cols[1]
-
+            title = link_tag.get_text(" ", strip=True) if link_tag else cols[1]
             title = clean_title(title)
 
             if not title:
                 continue
-
-            author = cols[2] if len(cols) > 2 else ""
-            views = cols[3] if len(cols) > 3 else "0"
-            likes = cols[4] if len(cols) > 4 else "0"
-            dislikes = cols[5] if len(cols) > 5 else "0"
 
             post_url = ""
             if link_tag and link_tag.get("href"):
@@ -292,10 +300,10 @@ def fetch_naver_board_pages(stock_code: str, max_pages: int = 3) -> pd.DataFrame
                 {
                     "date": date_text,
                     "title": title,
-                    "author": author,
-                    "views": to_int(views),
-                    "likes": to_int(likes),
-                    "dislikes": to_int(dislikes),
+                    "author": cols[2] if len(cols) > 2 else "",
+                    "views": to_int(cols[3] if len(cols) > 3 else "0"),
+                    "likes": to_int(cols[4] if len(cols) > 4 else "0"),
+                    "dislikes": to_int(cols[5] if len(cols) > 5 else "0"),
                     "url": post_url,
                     "page": page,
                 }
@@ -318,55 +326,271 @@ def fetch_naver_board_pages(stock_code: str, max_pages: int = 3) -> pd.DataFrame
 
 
 # ------------------------------------------------------------
-# 5) 감성 분석
+# 5) LLM 감성분석
 # ------------------------------------------------------------
 
-def count_hits(text: str, words: list[str]) -> int:
-    text = str(text)
-    return sum(1 for word in words if word in text)
+def fallback_rule_sentiment(title: str) -> dict[str, Any]:
+    text = str(title)
+    pos = sum(1 for word in FALLBACK_POSITIVE_WORDS if word in text)
+    neg = sum(1 for word in FALLBACK_NEGATIVE_WORDS if word in text)
+
+    if pos > neg:
+        code = "bullish"
+        reason = "백업 룰 기준 긍정 단어가 더 많음"
+    elif neg > pos:
+        code = "bearish"
+        reason = "백업 룰 기준 부정 단어가 더 많음"
+    else:
+        code = "neutral"
+        reason = "백업 룰 기준 방향성 불명확"
+
+    return {
+        "sentiment_code": code,
+        "sentiment": KOREAN_LABEL_MAP[code],
+        "confidence": 0.35,
+        "reason": reason,
+    }
 
 
-def classify_sentiment(text: str) -> str:
-    positive_hits = count_hits(text, POSITIVE_WORDS)
-    negative_hits = count_hits(text, NEGATIVE_WORDS)
+def parse_response_json(response: Any) -> dict[str, Any]:
+    if hasattr(response, "output_text") and response.output_text:
+        return json.loads(response.output_text)
 
-    if positive_hits > negative_hits:
-        return "긍정"
+    texts = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if text:
+                texts.append(text)
 
-    if negative_hits > positive_hits:
-        return "부정"
+    if texts:
+        return json.loads("\n".join(texts))
 
-    return "중립"
-
-
-def sentiment_to_score(label: str) -> int:
-    if label == "긍정":
-        return 1
-
-    if label == "부정":
-        return -1
-
-    return 0
+    raise ValueError("LLM 응답에서 JSON 텍스트를 찾지 못했습니다.")
 
 
-def get_sentiment_label(score: float) -> str:
-    if score >= 0.25:
-        return "긍정 우세"
+def classify_title_batch_with_llm(
+    batch_items: list[dict[str, Any]],
+    stock_name: str,
+    model: str,
+) -> list[dict[str, Any]]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
 
-    if score <= -0.25:
-        return "부정 우세"
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-    return "중립"
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "sentiment": {
+                            "type": "string",
+                            "enum": ["bullish", "bearish", "neutral", "sarcastic", "spam", "unknown"],
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "reason": {
+                            "type": "string",
+                        },
+                    },
+                    "required": ["id", "sentiment", "confidence", "reason"],
+                },
+            }
+        },
+        "required": ["items"],
+    }
+
+    system_prompt = """
+너는 한국 주식 커뮤니티 게시글 제목을 분석하는 금융 커뮤니티 감성 분류기다.
+
+분류 기준:
+- bullish: 주가 상승 기대, 매수 심리, 호재 반응, 수급 개선 기대
+- bearish: 주가 하락 우려, 매도 심리, 악재 반응, 손절/탈출/고점 경고
+- neutral: 단순 질문, 정보 공유, 방향성 없는 관망
+- sarcastic: 반어법, 조롱, 비꼼. 투자 심리상 대체로 약한 부정으로 본다.
+- spam: 광고, 리딩방, 도배, 종목과 무관한 글
+- unknown: 의미를 판단하기 어려운 글
+
+주의:
+- 단어 하나만 보지 말고 문장 전체 맥락을 봐라.
+- '간다', '대박', '손절' 같은 단어도 반어법이면 문맥대로 분류해라.
+- 결과는 반드시 입력 id별로 하나씩 반환해라.
+- reason은 한국어로 짧게 작성해라.
+"""
+
+    user_payload = {
+        "stock_name": stock_name,
+        "titles": batch_items,
+    }
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "다음 종목토론방 제목들을 감성 분류해줘.\n"
+                    f"{json.dumps(user_payload, ensure_ascii=False)}"
+                ),
+            },
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "stock_board_sentiment_batch",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        temperature=0,
+    )
+
+    parsed = parse_response_json(response)
+    return parsed.get("items", [])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def classify_titles_cached(
+    titles: tuple[str, ...],
+    stock_name: str,
+    model: str,
+    batch_size: int,
+    max_workers: int,
+    use_llm: bool,
+) -> list[dict[str, Any]]:
+    title_items = [{"id": idx, "title": title} for idx, title in enumerate(titles)]
+
+    if not use_llm or not OPENAI_API_KEY:
+        return [
+            {"id": item["id"], **fallback_rule_sentiment(item["title"])}
+            for item in title_items
+        ]
+
+    batches = [
+        title_items[i : i + batch_size]
+        for i in range(0, len(title_items), batch_size)
+    ]
+
+    results: list[dict[str, Any]] = []
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    classify_title_batch_with_llm,
+                    batch,
+                    stock_name,
+                    model,
+                ): batch
+                for batch in batches
+            }
+
+            for future in as_completed(future_map):
+                batch = future_map[future]
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    for item in batch:
+                        results.append(
+                            {
+                                "id": item["id"],
+                                **fallback_rule_sentiment(item["title"]),
+                            }
+                        )
+
+    except Exception:
+        results = [
+            {"id": item["id"], **fallback_rule_sentiment(item["title"])}
+            for item in title_items
+        ]
+
+    by_id = {int(item["id"]): item for item in results if "id" in item}
+
+    normalized = []
+    for item in title_items:
+        idx = item["id"]
+        result = by_id.get(idx)
+
+        if not result:
+            result = {"id": idx, **fallback_rule_sentiment(item["title"])}
+
+        code = result.get("sentiment", result.get("sentiment_code", "unknown"))
+        if code not in SENTIMENT_SCORE_MAP:
+            code = "unknown"
+
+        confidence = result.get("confidence", 0.5)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.5
+
+        confidence = min(max(confidence, 0.0), 1.0)
+
+        normalized.append(
+            {
+                "id": idx,
+                "sentiment_code": code,
+                "sentiment": KOREAN_LABEL_MAP.get(code, "불확실"),
+                "confidence": confidence,
+                "reason": str(result.get("reason", ""))[:80],
+            }
+        )
+
+    return sorted(normalized, key=lambda x: x["id"])
+
+
+def attach_llm_sentiment(
+    posts_df: pd.DataFrame,
+    stock_name: str,
+    model: str,
+    batch_size: int,
+    max_workers: int,
+    use_llm: bool,
+) -> pd.DataFrame:
+    df = posts_df.copy().reset_index(drop=True)
+
+    titles = tuple(df["title"].astype(str).tolist())
+
+    classifications = classify_titles_cached(
+        titles=titles,
+        stock_name=stock_name,
+        model=model,
+        batch_size=batch_size,
+        max_workers=max_workers,
+        use_llm=use_llm,
+    )
+
+    class_df = pd.DataFrame(classifications)
+
+    df = df.reset_index().rename(columns={"index": "id"})
+    df = df.merge(class_df, on="id", how="left")
+
+    df["sentiment_code"] = df["sentiment_code"].fillna("unknown")
+    df["sentiment"] = df["sentiment"].fillna("불확실")
+    df["confidence"] = df["confidence"].fillna(0.3)
+    df["reason"] = df["reason"].fillna("분류 실패")
+    df["sentiment_value"] = df["sentiment_code"].map(SENTIMENT_SCORE_MAP).fillna(0.0)
+
+    return df.drop(columns=["id"])
 
 
 # ------------------------------------------------------------
-# 6) 실시간 빈출 키워드 추출
+# 6) 실시간 빈출 키워드
 # ------------------------------------------------------------
 
 def tokenize_korean_title(text: str) -> list[str]:
     text = clean_text(text)
-
-    # 한글, 영어, 숫자만 남김
     candidates = re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
 
     tokens = []
@@ -375,33 +599,16 @@ def tokenize_korean_title(text: str) -> list[str]:
 
         if len(token) < 2:
             continue
-
         if token in STOPWORDS:
             continue
-
         if token.isdigit():
             continue
-
-        # 너무 일반적인 종결 표현 제거
         if token.endswith(("네요", "합니다", "는데", "듯요", "인가", "이냐", "냐고")) and len(token) <= 4:
             continue
 
         tokens.append(token)
 
     return tokens
-
-
-def keyword_sentiment(keyword: str) -> str:
-    pos = count_hits(keyword, POSITIVE_WORDS)
-    neg = count_hits(keyword, NEGATIVE_WORDS)
-
-    if pos > neg:
-        return "긍정"
-
-    if neg > pos:
-        return "부정"
-
-    return "관심"
 
 
 def extract_realtime_keywords(posts_df: pd.DataFrame, top_n: int = 20) -> list[dict[str, Any]]:
@@ -412,10 +619,12 @@ def extract_realtime_keywords(posts_df: pd.DataFrame, top_n: int = 20) -> list[d
     view_counter = Counter()
     like_counter = Counter()
     dislike_counter = Counter()
+    sentiment_counter: dict[str, Counter] = {}
 
     for _, row in posts_df.iterrows():
         title = str(row.get("title", ""))
         tokens = tokenize_korean_title(title)
+        sentiment = str(row.get("sentiment", "중립"))
 
         for token in tokens:
             counter[token] += 1
@@ -423,26 +632,26 @@ def extract_realtime_keywords(posts_df: pd.DataFrame, top_n: int = 20) -> list[d
             like_counter[token] += int(row.get("likes", 0) or 0)
             dislike_counter[token] += int(row.get("dislikes", 0) or 0)
 
+            if token not in sentiment_counter:
+                sentiment_counter[token] = Counter()
+            sentiment_counter[token][sentiment] += 1
+
     results = []
 
     for keyword, count in counter.items():
         views = view_counter[keyword]
         likes = like_counter[keyword]
         dislikes = dislike_counter[keyword]
+        dominant_sentiment = sentiment_counter[keyword].most_common(1)[0][0]
 
-        score = (
-            count * 20
-            + math.log1p(views) * 8
-            + likes * 2
-            - dislikes
-        )
+        score = count * 20 + math.log1p(views) * 8 + likes * 2 - dislikes
 
         results.append(
             {
                 "keyword": keyword,
                 "count": int(count),
                 "score": round(score, 1),
-                "sentiment": keyword_sentiment(keyword),
+                "sentiment": dominant_sentiment,
                 "views": int(views),
                 "likes": int(likes),
                 "dislikes": int(dislikes),
@@ -451,28 +660,6 @@ def extract_realtime_keywords(posts_df: pd.DataFrame, top_n: int = 20) -> list[d
 
     results = sorted(results, key=lambda x: (x["count"], x["score"]), reverse=True)
     return results[:top_n]
-
-
-def keyword_sentiment_score(top_keywords: list[dict[str, Any]]) -> float:
-    if not top_keywords:
-        return 0.0
-
-    total_score = sum(max(float(item["score"]), 0.1) for item in top_keywords)
-    if total_score == 0:
-        return 0.0
-
-    weighted = 0.0
-
-    for item in top_keywords:
-        sentiment = item["sentiment"]
-        score = max(float(item["score"]), 0.1)
-
-        if sentiment == "긍정":
-            weighted += score
-        elif sentiment == "부정":
-            weighted -= score
-
-    return weighted / total_score
 
 
 # ------------------------------------------------------------
@@ -484,14 +671,22 @@ def build_stock_summary(
     stock_name: str,
     price_info: dict[str, str],
     posts_df: pd.DataFrame,
+    model: str,
+    batch_size: int,
+    max_workers: int,
+    use_llm: bool,
 ) -> dict[str, Any]:
     if posts_df.empty:
         raise ValueError("수집된 게시글이 없습니다.")
 
-    df = posts_df.copy()
-
-    df["sentiment"] = df["title"].apply(classify_sentiment)
-    df["sentiment_value"] = df["sentiment"].apply(sentiment_to_score)
+    df = attach_llm_sentiment(
+        posts_df=posts_df,
+        stock_name=stock_name,
+        model=model,
+        batch_size=batch_size,
+        max_workers=max_workers,
+        use_llm=use_llm,
+    )
 
     df["weight"] = (
         1
@@ -500,25 +695,28 @@ def build_stock_summary(
         - df["dislikes"].fillna(0) * 0.08
     ).clip(lower=0.2)
 
-    total_weight = df["weight"].sum()
+    df["confidence_weight"] = df["weight"] * df["confidence"].fillna(0.5)
+
+    total_weight = df["confidence_weight"].sum()
 
     if total_weight == 0:
-        post_sentiment_score = 0.0
+        sentiment_score = 0.0
     else:
-        post_sentiment_score = float(
-            (df["sentiment_value"] * df["weight"]).sum() / total_weight
+        sentiment_score = float(
+            (df["sentiment_value"] * df["confidence_weight"]).sum() / total_weight
         )
 
-    top_keywords = extract_realtime_keywords(df, top_n=20)
-    keyword_score = keyword_sentiment_score(top_keywords)
-
-    # 게시글 감성 70%, 실시간 키워드 감성 30%
-    final_sentiment_score = post_sentiment_score * 0.7 + keyword_score * 0.3
-
     message_volume = len(df)
-    bullish_ratio = round((df["sentiment"] == "긍정").mean() * 100)
-    bearish_ratio = round((df["sentiment"] == "부정").mean() * 100)
-    neutral_ratio = 100 - bullish_ratio - bearish_ratio
+
+    bullish_ratio = round((df["sentiment_code"] == "bullish").mean() * 100)
+    bearish_ratio = round((df["sentiment_code"] == "bearish").mean() * 100)
+    sarcastic_ratio = round((df["sentiment_code"] == "sarcastic").mean() * 100)
+    spam_ratio = round((df["sentiment_code"] == "spam").mean() * 100)
+
+    neutral_ratio = max(
+        0,
+        100 - bullish_ratio - bearish_ratio - sarcastic_ratio - spam_ratio,
+    )
 
     avg_views = df["views"].mean() if message_volume else 0
     total_engagement = df["likes"].sum() + df["dislikes"].sum()
@@ -532,21 +730,36 @@ def build_stock_summary(
         ),
     )
 
+    top_keywords = extract_realtime_keywords(df, top_n=20)
+
     posts = df[
-        ["title", "sentiment", "views", "likes", "dislikes", "date", "url", "page"]
-    ].head(50).to_dict("records")
+        [
+            "title",
+            "sentiment",
+            "sentiment_code",
+            "confidence",
+            "reason",
+            "views",
+            "likes",
+            "dislikes",
+            "date",
+            "url",
+            "page",
+        ]
+    ].head(80).to_dict("records")
 
     return {
         "name": price_info.get("name") or stock_name,
         "price": price_info.get("price", "-"),
         "change": price_info.get("change", "-"),
         "change_text": price_info.get("change_text", "-"),
-        "sentiment_score": final_sentiment_score,
-        "post_sentiment_score": post_sentiment_score,
-        "keyword_sentiment_score": keyword_score,
+        "sentiment_score": sentiment_score,
+        "post_sentiment_score": sentiment_score,
         "bullish_ratio": bullish_ratio,
         "bearish_ratio": bearish_ratio,
         "neutral_ratio": neutral_ratio,
+        "sarcastic_ratio": sarcastic_ratio,
+        "spam_ratio": spam_ratio,
         "message_volume": message_volume,
         "hype_index": hype_index,
         "updated_at": datetime.now().strftime("%H:%M"),
@@ -556,12 +769,19 @@ def build_stock_summary(
     }
 
 
+def get_sentiment_label(score: float) -> str:
+    if score >= 0.25:
+        return "긍정 우세"
+    if score <= -0.25:
+        return "부정 우세"
+    return "중립"
+
+
 def keyword_dataframe(top_keywords: list[dict[str, Any]]) -> pd.DataFrame:
     if not top_keywords:
         return pd.DataFrame(
             columns=["keyword", "count", "score", "sentiment", "views", "likes", "dislikes"]
         )
-
     return pd.DataFrame(top_keywords)
 
 
@@ -571,7 +791,6 @@ def render_keyword_chips(top_keywords: list[dict[str, Any]]) -> None:
         return
 
     max_score = max(float(item["score"]) for item in top_keywords) or 1
-
     html = "<div style='display:flex;flex-wrap:wrap;gap:8px;'>"
 
     for item in top_keywords[:20]:
@@ -585,9 +804,12 @@ def render_keyword_chips(top_keywords: list[dict[str, Any]]) -> None:
         if sentiment == "긍정":
             bg = "#dcfce7"
             color = "#166534"
-        elif sentiment == "부정":
+        elif sentiment in ["부정", "조롱/반어"]:
             bg = "#fee2e2"
             color = "#991b1b"
+        elif sentiment == "스팸":
+            bg = "#f3f4f6"
+            color = "#6b7280"
         else:
             bg = "#f1f5f9"
             color = "#334155"
@@ -636,6 +858,27 @@ with st.sidebar:
     )
 
     use_live_data = st.toggle("실제 네이버 데이터 수집", value=True)
+    use_llm = st.toggle("OpenAI LLM 감성분석 사용", value=True)
+
+    st.caption(f"LLM 모델: {OPENAI_MODEL}")
+
+    batch_size = st.slider(
+        "LLM 배치 크기",
+        min_value=10,
+        max_value=40,
+        value=25,
+        step=5,
+        help="한 번의 API 호출에 넣을 제목 수입니다.",
+    )
+
+    max_workers = st.slider(
+        "LLM 병렬 요청 수",
+        min_value=1,
+        max_value=6,
+        value=3,
+        step=1,
+        help="너무 높이면 API rate limit에 걸릴 수 있습니다.",
+    )
 
     if st.button("새로고침", use_container_width=True):
         st.cache_data.clear()
@@ -644,7 +887,7 @@ with st.sidebar:
     st.divider()
     st.caption("현재가와 등락률은 네이버 금융 종목 메인에서 가져옵니다.")
     st.caption("종목토론방은 선택한 페이지 수만큼 최신 글을 수집합니다.")
-    st.caption("수집 실패 시 mock 데이터로 자동 전환됩니다.")
+    st.caption("LLM 실패 시 백업 룰 기반 감성분석으로 자동 전환됩니다.")
 
 # ------------------------------------------------------------
 # 9) 데이터 로딩
@@ -655,17 +898,29 @@ stock_name = find_stock_name(stock_code)
 
 data_source = "mock"
 load_error = None
+llm_status = "미사용"
 
 if use_live_data:
     try:
         price_info = fetch_stock_price(stock_code)
         live_posts_df = fetch_naver_board_pages(stock_code, max_pages=max_pages)
 
+        if use_llm and OPENAI_API_KEY:
+            llm_status = f"OpenAI LLM 사용: {OPENAI_MODEL}"
+        elif use_llm and not OPENAI_API_KEY:
+            llm_status = "OPENAI_API_KEY 없음 → 백업 룰 사용"
+        else:
+            llm_status = "백업 룰 사용"
+
         stock = build_stock_summary(
             stock_code=stock_code,
             stock_name=stock_name,
             price_info=price_info,
             posts_df=live_posts_df,
+            model=OPENAI_MODEL,
+            batch_size=batch_size,
+            max_workers=max_workers,
+            use_llm=use_llm,
         )
 
         data_source = "live"
@@ -683,13 +938,13 @@ else:
 st.title("📈 종목토론방 실시간 여론 대시보드")
 st.caption(
     "네이버 종목토론방의 최신 게시글 제목을 기반으로 "
-    "현재가, 등락률, 커뮤니티 감성지수, 빈출 키워드, 과열도를 추정합니다."
+    "현재가, 등락률, LLM 감성지수, 빈출 키워드, 과열도를 추정합니다."
 )
 
 if data_source == "live":
     st.success(
         f"실제 네이버 데이터를 수집해 표시 중입니다. "
-        f"종목토론방 {max_pages}페이지 기준입니다."
+        f"종목토론방 {max_pages}페이지 기준 · {llm_status}"
     )
 elif load_error:
     st.warning(f"실제 데이터 수집에 실패해 mock 데이터로 표시합니다. 오류: {load_error}")
@@ -700,7 +955,6 @@ header_left, header_right = st.columns([2, 1])
 
 with header_left:
     st.subheader(f"{stock['name']} · {stock_code}")
-
     st.write(
         f"현재가 **{stock['price']}원** · "
         f"등락률 **{stock['change']}** · "
@@ -710,7 +964,6 @@ with header_left:
 
 with header_right:
     label = get_sentiment_label(stock["sentiment_score"])
-
     st.metric(
         label="오늘의 감성 상태",
         value=label,
@@ -740,24 +993,27 @@ metric_cols[2].metric(
 )
 
 metric_cols[3].metric(
-    "감성 점수",
+    "LLM 감성 점수",
     f"{stock['sentiment_score']:+.2f}",
-    "게시글 70% + 키워드 30%",
+    "-1 ~ +1",
 )
 
-score_cols = st.columns(2)
+detail_cols = st.columns(3)
 
-with score_cols[0]:
-    st.metric(
-        "게시글 기반 감성",
-        f"{stock.get('post_sentiment_score', stock['sentiment_score']):+.2f}",
-    )
+detail_cols[0].metric(
+    "중립 비율",
+    f"{stock.get('neutral_ratio', 0)}%",
+)
 
-with score_cols[1]:
-    st.metric(
-        "빈출 키워드 기반 감성",
-        f"{stock.get('keyword_sentiment_score', 0):+.2f}",
-    )
+detail_cols[1].metric(
+    "조롱/반어 비율",
+    f"{stock.get('sarcastic_ratio', 0)}%",
+)
+
+detail_cols[2].metric(
+    "스팸 비율",
+    f"{stock.get('spam_ratio', 0)}%",
+)
 
 # ------------------------------------------------------------
 # 11) 차트
@@ -770,11 +1026,13 @@ with chart_col_1:
 
     ratio_df = pd.DataFrame(
         {
-            "sentiment": ["긍정", "부정", "중립"],
+            "sentiment": ["긍정", "부정", "중립", "조롱/반어", "스팸"],
             "ratio": [
-                stock["bullish_ratio"],
-                stock["bearish_ratio"],
-                stock["neutral_ratio"],
+                stock.get("bullish_ratio", 0),
+                stock.get("bearish_ratio", 0),
+                stock.get("neutral_ratio", 0),
+                stock.get("sarcastic_ratio", 0),
+                stock.get("spam_ratio", 0),
             ],
         }
     )
@@ -794,7 +1052,7 @@ with chart_col_2:
             "keyword": "키워드",
             "count": "빈도",
             "score": "가중치",
-            "sentiment": "키워드 감성",
+            "sentiment": "주요 감성",
             "views": "조회 합",
             "likes": "추천 합",
             "dislikes": "비추천 합",
@@ -826,6 +1084,9 @@ st.dataframe(
     column_config={
         "title": "제목",
         "sentiment": "감성",
+        "sentiment_code": "감성 코드",
+        "confidence": "신뢰도",
+        "reason": "LLM 판단 근거",
         "views": "조회",
         "likes": "추천",
         "dislikes": "비추천",
@@ -855,13 +1116,18 @@ with st.expander("현재 MVP 구조 보기"):
 현재 버전:
 1. 네이버 금융 종목 메인에서 현재가와 등락률 수집
 2. 네이버 종목토론방에서 선택한 페이지 수만큼 최신 글 수집
-3. 제목 기반 룰 감성분석
-4. 실제 제목에서 빈출 키워드 추출
-5. 빈출 키워드를 긍정/부정/관심으로 분류
-6. 게시글 감성 70% + 키워드 감성 30%로 최종 감성 점수 계산
+3. 게시글 제목을 배치로 묶어 OpenAI LLM 감성분석
+4. 여러 배치를 병렬 처리해 지연시간 감소
+5. LLM 결과로 긍정/부정/중립/조롱/스팸 비율 계산
+6. 실제 제목에서 빈출 키워드 추출
+7. 조회수·추천수·비추천수·LLM 신뢰도로 감성 점수와 과열도 계산
+
+환경변수:
+- OPENAI_API_KEY
+- OPENAI_MODEL, 기본값 gpt-4.1-mini
 
 주의:
-- 페이지 수를 과도하게 늘리지 않는 것이 좋습니다.
+- 병렬 요청 수를 과도하게 높이면 rate limit에 걸릴 수 있습니다.
 - 실제 서비스에서는 주기적 수집 + DB 누적 방식이 더 안정적입니다.
         """,
         language="text",
