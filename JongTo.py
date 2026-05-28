@@ -95,6 +95,20 @@ MOCK_STOCKS = {
 # 2) 네이버 데이터 수집
 # ------------------------------------------------------------
 
+def decode_naver_response(response: requests.Response) -> str:
+    """네이버 금융 페이지 한글 깨짐 방지용 디코더.
+
+    Render 환경에서는 requests가 인코딩을 잘못 추정해 종목토론방 제목이
+    깨질 수 있으므로 response.text 대신 bytes를 직접 디코딩합니다.
+    """
+    for encoding in ("cp949", "euc-kr", "utf-8"):
+        try:
+            return response.content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return response.content.decode("cp949", errors="replace")
+
+
 def to_int(value: Any) -> int:
     text = str(value).replace(",", "").replace("+", "").strip()
     return int(text) if text.isdigit() else 0
@@ -124,9 +138,9 @@ def fetch_naver_board_pages(stock_code: str, page_count: int = 10, delay_sec: fl
             timeout=10,
         )
         response.raise_for_status()
-        response.encoding = "euc-kr"
+        html = decode_naver_response(response)
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
 
         for tr in soup.select("table.type2 tr"):
             tds = tr.select("td")
@@ -181,8 +195,8 @@ def fetch_naver_price_info(stock_code: str) -> dict[str, str]:
         timeout=10,
     )
     response.raise_for_status()
-    response.encoding = "euc-kr"
-    soup = BeautifulSoup(response.text, "html.parser")
+    html = decode_naver_response(response)
+    soup = BeautifulSoup(html, "html.parser")
 
     price = "-"
     change = "-"
@@ -236,7 +250,14 @@ def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(rows).dropna(subset=["date"])
-    return df.sort_values("date")
+    df = df.sort_values("date")
+
+    if not df.empty:
+        df["ma5"] = df["close"].rolling(window=5).mean()
+        df["ma20"] = df["close"].rolling(window=20).mean()
+        df["ma60"] = df["close"].rolling(window=60).mean()
+
+    return df
 
 
 # ------------------------------------------------------------
@@ -576,16 +597,36 @@ metric_cols[3].metric("감성 점수", f"{stock['sentiment_score']:+.2f}", "-1 ~
 price_col, sentiment_col = st.columns([1.4, 1])
 
 with price_col:
-    st.subheader("주가 흐름 추이")
+    st.subheader("주가 흐름 추이 + 이동평균선")
     history_df = stock.get("history_df", pd.DataFrame())
     if isinstance(history_df, pd.DataFrame) and not history_df.empty:
-        price_chart_df = history_df.set_index("date")[["close"]].rename(columns={"close": "종가"})
+        available_columns = [col for col in ["close", "ma5", "ma20", "ma60"] if col in history_df.columns]
+        price_chart_df = history_df.set_index("date")[available_columns].rename(
+            columns={
+                "close": "종가",
+                "ma5": "5일선",
+                "ma20": "20일선",
+                "ma60": "60일선",
+            }
+        )
         st.line_chart(price_chart_df, use_container_width=True)
 
         latest = history_df.iloc[-1]
         first = history_df.iloc[0]
         period_return = 0.0 if first["close"] == 0 else (latest["close"] / first["close"] - 1) * 100
-        st.caption(f"기간 수익률: {period_return:+.2f}% · 최근 종가: {int(latest['close']):,}원")
+
+        ma_caption_parts = []
+        if "ma5" in latest and pd.notna(latest["ma5"]):
+            ma_caption_parts.append(f"5일선 {int(latest['ma5']):,}원")
+        if "ma20" in latest and pd.notna(latest["ma20"]):
+            ma_caption_parts.append(f"20일선 {int(latest['ma20']):,}원")
+        if "ma60" in latest and pd.notna(latest["ma60"]):
+            ma_caption_parts.append(f"60일선 {int(latest['ma60']):,}원")
+
+        st.caption(
+            f"기간 수익률: {period_return:+.2f}% · 최근 종가: {int(latest['close']):,}원"
+            + (" · " + " · ".join(ma_caption_parts) if ma_caption_parts else "")
+        )
     else:
         st.caption("주가 추이 데이터를 불러오지 못했습니다.")
 
