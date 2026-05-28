@@ -85,6 +85,7 @@ MOCK_STOCKS = {
         "updated_at": "오늘 14:35",
         "positive_keywords": {"반등": 92, "실적": 78, "외국인": 65, "매수": 61, "HBM": 55, "저평가": 42},
         "negative_keywords": {"횡보": 68, "물림": 48, "매도": 39, "실망": 34, "하락": 31},
+        "frequent_terms": {"반등": 9, "실적": 7, "외국인": 6, "매수": 5, "횡보": 4, "하락": 3},
         "posts": [
             {"title": "외국인 다시 들어오는 분위기네요", "sentiment": "긍정", "sentiment_code": "bullish", "confidence": 0.8, "reason": "외국인 유입과 긍정적 분위기 표현.", "views": 482, "likes": 11, "dislikes": 2, "date": "-", "source_page": 1},
             {"title": "오늘 거래량 보면 단기 반등 가능성 있음", "sentiment": "긍정", "sentiment_code": "bullish", "confidence": 0.8, "reason": "반등 가능성 언급.", "views": 331, "likes": 8, "dislikes": 1, "date": "-", "source_page": 1},
@@ -279,13 +280,13 @@ def count_hits(text: str, words: list[str]) -> int:
 
 
 def classify_sentiment_detail(text: str) -> dict[str, Any]:
-    """제목 단위 엄격 분류기.
+    """제목 단위 균형형 감성 분류기.
 
     핵심 원칙:
-    1. 불확실/unknown을 최종 라벨로 내보내지 않습니다.
-    2. 중립은 단순 시황·공시·수치 전달에만 제한합니다.
-    3. 조롱, 의심, 불만, 질문형, 맥락 없는 짧은 글은 대체로 부정으로 봅니다.
-    4. 종목 상승 기대, 매수 의지, 목표가, 반등 기대는 긍정으로 봅니다.
+    1. 최종 라벨은 긍정/부정/중립만 사용합니다.
+    2. 중립은 단순 정보성 문장뿐 아니라 방향성이 약한 질문/잡담에도 허용합니다.
+    3. 명확한 조롱, 불만, 하락 우려는 부정으로 봅니다.
+    4. 상승 기대, 매수/보유 의지, 목표가 언급은 긍정으로 봅니다.
     """
     text = str(text).strip()
 
@@ -296,68 +297,105 @@ def classify_sentiment_detail(text: str) -> dict[str, Any]:
     offtopic_hits = count_hits(text, OFFTOPIC_HINTS)
 
     has_laughter = bool(re.search(r"[ㅋㅎ]{2,}", text))
-    has_question = any(token in text for token in ["?", "냐", "인가", "맞냐", "노조?", "왜", "뭐냐", "어쩌", "가능?"])
+    has_question = any(token in text for token in ["?", "냐", "인가", "맞냐", "왜", "뭐냐", "어쩌", "가능?"])
     has_doubt = any(token in text for token in ["아닌", "어렵", "모르", "애매", "불안", "불확", "글쎄", "흠", "과연"])
-    has_complaint = any(token in text for token in ["너무", "제발", "그동안", "또", "맨날", "언제", "하...", "아오", "에휴", "휴"])
+    has_complaint = any(token in text for token in ["제발", "그동안", "맨날", "하...", "아오", "에휴"])
     has_target_price_up = bool(re.search(r"[0-9]+만전자|[0-9]+만원?간다|[0-9]+만닉스|목표가|신고가|최고가", text))
     has_buy_or_hold = any(token in text for token in ["매수", "추매", "보유", "존버", "탑승", "분할매수", "익절", "수익"])
     has_upward_phrase = any(token in text for token in ["오를", "오른", "올라", "상승", "반등", "간다", "날라", "날아", "쏜다", "불기둥", "양봉"])
     has_downward_phrase = any(token in text for token in ["내릴", "떨어", "하락", "폭락", "손절", "매도", "못가", "안오", "물림", "물렸다"])
+    is_short_text = len(text.replace(" ", "")) <= 8
 
-    if has_laughter or sarcasm_hits >= 1:
+    positive_score = positive_hits * 2
+    negative_score = negative_hits * 2
+
+    if has_target_price_up:
+        positive_score += 3
+    if has_buy_or_hold:
+        positive_score += 2
+    if has_upward_phrase:
+        positive_score += 2
+
+    if has_downward_phrase:
+        negative_score += 3
+    if has_doubt:
+        negative_score += 1
+    if has_complaint:
+        negative_score += 2
+    if has_question:
+        negative_score += 0.5
+    if sarcasm_hits >= 1 or has_laughter:
+        negative_score += 3
+
+    # 명확한 조롱/비꼼은 부정. 단, 상승 키워드와 함께 쓰인 단순 웃음은 과도하게 부정 처리하지 않음.
+    if (sarcasm_hits >= 1 or has_laughter) and negative_score > positive_score + 1:
         return {
             "sentiment": "부정",
             "sentiment_code": "sarcastic",
-            "score": -0.9,
-            "confidence": 0.9,
-            "reason": "웃음/비꼼/조롱성 표현은 투자심리 악화로 판단.",
+            "score": -0.85,
+            "confidence": 0.86,
+            "reason": "비꼼/조롱성 표현과 부정 맥락이 함께 감지됨.",
         }
 
-    if has_target_price_up or has_buy_or_hold or has_upward_phrase or (positive_hits >= 1 and positive_hits >= negative_hits):
-        confidence = min(0.95, 0.78 + positive_hits * 0.05)
+    # 명확한 긍정
+    if positive_score >= negative_score + 2:
+        confidence = min(0.93, 0.72 + positive_score * 0.04)
         return {
             "sentiment": "긍정",
             "sentiment_code": "bullish",
             "score": 1.0,
             "confidence": confidence,
-            "reason": "상승 기대·목표가·매수/보유 의지 표현이 감지됨.",
+            "reason": "상승 기대·목표가·매수/보유 의지 표현이 우세함.",
         }
 
-    if negative_hits >= 1 or has_downward_phrase or has_question or has_doubt or has_complaint:
-        confidence = min(0.95, 0.76 + negative_hits * 0.05)
+    # 명확한 부정
+    if negative_score >= positive_score + 2:
+        confidence = min(0.93, 0.72 + negative_score * 0.04)
         return {
             "sentiment": "부정",
             "sentiment_code": "bearish",
             "score": -1.0,
             "confidence": confidence,
-            "reason": "우려·불만·의심·하락성 표현이 감지되어 부정으로 판단.",
+            "reason": "우려·불만·하락성 표현이 우세함.",
         }
 
-    is_short_noise = len(text.replace(" ", "")) <= 8
-    if factual_hits >= 1 and offtopic_hits == 0 and not is_short_noise:
+    # 시황/수급/공시성 정보는 중립
+    if factual_hits >= 1 and offtopic_hits == 0:
         return {
             "sentiment": "중립",
-            "sentiment_code": "neutral",
+            "sentiment_code": "neutral_info",
             "score": 0.0,
-            "confidence": 0.75,
+            "confidence": 0.76,
             "reason": "감정보다는 시장/수급/시황 정보 전달에 가까움.",
         }
 
+    # 종목과 직접 관련 낮은 잡음성 글은 감성으로 과잉 해석하지 않고 중립 잡음 처리
     if offtopic_hits >= 1:
         return {
-            "sentiment": "부정",
-            "sentiment_code": "noise_bearish",
-            "score": -0.6,
-            "confidence": 0.7,
-            "reason": "종목과 직접 관련 낮은 잡음성 글로 커뮤니티 심리 악화 요인.",
+            "sentiment": "중립",
+            "sentiment_code": "noise_neutral",
+            "score": 0.0,
+            "confidence": 0.65,
+            "reason": "종목 감성과 직접 연결하기 어려운 비시장성/잡음성 주제.",
         }
 
+    # 짧은 질문/잡담은 부정으로 몰지 않고 중립 처리
+    if is_short_text or has_question:
+        return {
+            "sentiment": "중립",
+            "sentiment_code": "neutral_chat",
+            "score": 0.0,
+            "confidence": 0.64,
+            "reason": "방향성이 약한 질문/짧은 잡담으로 중립 처리.",
+        }
+
+    # 남는 애매한 문장은 약한 중립으로 둠
     return {
-        "sentiment": "부정",
-        "sentiment_code": "weak_bearish",
-        "score": -0.45,
-        "confidence": 0.65,
-        "reason": "명확한 긍정 근거가 없어 보수적으로 약한 부정 처리.",
+        "sentiment": "중립",
+        "sentiment_code": "neutral_weak",
+        "score": 0.0,
+        "confidence": 0.6,
+        "reason": "긍정/부정 근거가 비슷하거나 부족해 중립 처리.",
     }
 
 
@@ -387,6 +425,43 @@ def extract_keywords(posts_df: pd.DataFrame, sentiment_label: str, vocabulary: l
             result[word] = int(count * 20 + math.log1p(matched_views) * 10)
 
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True)[:10])
+
+
+def extract_frequent_terms(posts_df: pd.DataFrame, top_n: int = 40) -> dict[str, int]:
+    """감성과 무관하게 전체 게시글 제목에서 빈출 어휘를 추출합니다."""
+    if posts_df.empty or "title" not in posts_df.columns:
+        return {}
+
+    stopwords = {
+        "오늘", "내일", "지금", "이번", "저번", "그냥", "정말", "진짜", "너무", "계속", "다시",
+        "삼성", "삼성전자", "전자", "하이닉스", "네이버", "카카오", "주식", "종목", "주가", "사람",
+        "합니다", "있다", "있는", "없는", "네요", "인가요", "가나요", "입니다", "그리고", "근데",
+        "ㅋㅋ", "ㅎㅎ", "ㅠㅠ", "ㅜㅜ", "이제", "여기", "그거", "이거", "저거", "대한",
+    }
+
+    counter: dict[str, int] = {}
+    titles = " ".join(posts_df["title"].astype(str).tolist()).lower()
+
+    # 한글/영문/숫자 토큰 추출. 2글자 이상만 사용.
+    tokens = re.findall(r"[가-힣a-zA-Z0-9]{2,}", titles)
+    for token in tokens:
+        token = token.strip().lower()
+        if len(token) < 2 or token in stopwords:
+            continue
+        if token.isdigit():
+            continue
+        counter[token] = counter.get(token, 0) + 1
+
+    # 도메인 키워드는 토큰화로 놓치기 쉬워 별도 보강
+    domain_terms = POSITIVE_WORDS + NEGATIVE_WORDS + SARCASM_HINTS + FACTUAL_MARKET_HINTS
+    for word in domain_terms:
+        if len(word) < 2:
+            continue
+        count = titles.count(word.lower())
+        if count > 0 and word.lower() not in stopwords:
+            counter[word] = counter.get(word, 0) + count * 2
+
+    return dict(sorted(counter.items(), key=lambda x: x[1], reverse=True)[:top_n])
 
 
 def build_stock_summary(
@@ -446,6 +521,7 @@ def build_stock_summary(
         "updated_at": datetime.now().strftime("%H:%M"),
         "positive_keywords": extract_keywords(df, "긍정", POSITIVE_WORDS),
         "negative_keywords": extract_keywords(df, "부정", NEGATIVE_WORDS + SARCASM_HINTS),
+        "frequent_terms": extract_frequent_terms(df),
         "posts": posts,
         "raw_posts_df": df,
         "history_df": history_df if history_df is not None else pd.DataFrame(),
@@ -531,7 +607,7 @@ with st.sidebar:
 
     st.divider()
     st.caption("여러 페이지 수집으로 표본을 늘렸습니다.")
-    st.caption("감성은 불확실 라벨을 제거하고, 애매한 투자자 심리는 약한 부정으로 엄격 처리합니다.")
+    st.caption("감성은 긍정/부정/중립만 사용하되, 애매한 짧은 질문과 잡담은 중립으로 두어 과도한 부정 편향을 줄였습니다.")
 
 # ------------------------------------------------------------
 # 5) Data loading
@@ -674,6 +750,11 @@ with chart_col_2:
 # ------------------------------------------------------------
 # 8) Keyword cloud and posts
 # ------------------------------------------------------------
+
+st.subheader("전체 빈출 어휘 워드클라우드")
+render_keyword_chips(stock.get("frequent_terms", {}))
+
+st.caption("감성 분류와 무관하게 전체 제목에서 자주 등장한 단어입니다. 시장 관심사와 이슈 파악용으로 사용하세요.")
 
 keyword_col_1, keyword_col_2 = st.columns(2)
 
