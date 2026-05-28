@@ -44,6 +44,8 @@ POSITIVE_WORDS = [
     "상승", "불장", "기대", "저평가", "수급", "실적", "목표가", "외국인", "기관", "강세",
     "랠리", "회복", "성장", "수혜", "흑자", "계약", "수주", "좋다", "버틴다", "추세",
     "역대급", "최고가", "신기록", "어닝", "서프라이즈", "개선", "턴어라운드", "바닥", "저점",
+    "날라", "날아", "불기둥", "양봉", "쏜다", "오를", "오른", "올라", "상방", "우상향",
+    "100만전자", "10만전자", "20만닉스", "엔비디아", "ai", "hbm", "반도체", "탑승", "존버", "추매",
 ]
 
 NEGATIVE_WORDS = [
@@ -51,6 +53,8 @@ NEGATIVE_WORDS = [
     "떡락", "하방", "실망", "폭망", "고점", "과열", "조정", "매도", "부진", "적자",
     "리스크", "불안", "급락", "던져", "털림", "횡보", "매물", "약세", "위험", "거품",
     "해소", "무자비", "폭주", "박살", "나락", "답없", "개잡", "물타", "탈출", "지옥", "공매",
+    "안오", "못가", "못 간", "글렀", "불가능", "시체", "설거지", "물폭탄", "던진", "순매도",
+    "빤스런", "답답", "지겹", "속았", "사기", "무너", "깨짐", "깨진", "추락", "한숨",
 ]
 
 SARCASM_HINTS = [
@@ -275,12 +279,15 @@ def count_hits(text: str, words: list[str]) -> int:
 
 
 def classify_sentiment_detail(text: str) -> dict[str, Any]:
-    """제목 단위 냉정 분류기.
+    """제목 단위 엄격 분류기.
 
-    중립을 보수적으로 줄이고, 조롱/반어/비꼼은 부정 계열로 처리합니다.
+    핵심 원칙:
+    1. 불확실/unknown을 최종 라벨로 내보내지 않습니다.
+    2. 중립은 단순 시황·공시·수치 전달에만 제한합니다.
+    3. 조롱, 의심, 불만, 질문형, 맥락 없는 짧은 글은 대체로 부정으로 봅니다.
+    4. 종목 상승 기대, 매수 의지, 목표가, 반등 기대는 긍정으로 봅니다.
     """
     text = str(text).strip()
-    lowered = text.lower()
 
     positive_hits = count_hits(text, POSITIVE_WORDS)
     negative_hits = count_hits(text, NEGATIVE_WORDS)
@@ -289,71 +296,68 @@ def classify_sentiment_detail(text: str) -> dict[str, Any]:
     offtopic_hits = count_hits(text, OFFTOPIC_HINTS)
 
     has_laughter = bool(re.search(r"[ㅋㅎ]{2,}", text))
-    has_question_or_doubt = any(token in text for token in ["?", "냐", "인가", "아닌", "어렵", "불확실", "모르", "애매"])
-    has_emphasis_negative = any(token in text for token in ["무자비", "폭락", "급락", "해소", "물폭탄", "지옥", "나락", "박살"])
+    has_question = any(token in text for token in ["?", "냐", "인가", "맞냐", "노조?", "왜", "뭐냐", "어쩌", "가능?"])
+    has_doubt = any(token in text for token in ["아닌", "어렵", "모르", "애매", "불안", "불확", "글쎄", "흠", "과연"])
+    has_complaint = any(token in text for token in ["너무", "제발", "그동안", "또", "맨날", "언제", "하...", "아오", "에휴", "휴"])
+    has_target_price_up = bool(re.search(r"[0-9]+만전자|[0-9]+만원?간다|[0-9]+만닉스|목표가|신고가|최고가", text))
+    has_buy_or_hold = any(token in text for token in ["매수", "추매", "보유", "존버", "탑승", "분할매수", "익절", "수익"])
+    has_upward_phrase = any(token in text for token in ["오를", "오른", "올라", "상승", "반등", "간다", "날라", "날아", "쏜다", "불기둥", "양봉"])
+    has_downward_phrase = any(token in text for token in ["내릴", "떨어", "하락", "폭락", "손절", "매도", "못가", "안오", "물림", "물렸다"])
 
-    if has_laughter or sarcasm_hits >= 2 or (sarcasm_hits >= 1 and negative_hits >= 1):
+    if has_laughter or sarcasm_hits >= 1:
         return {
             "sentiment": "부정",
             "sentiment_code": "sarcastic",
-            "score": -0.8,
-            "confidence": 0.9 if sarcasm_hits >= 2 or has_laughter else 0.8,
-            "reason": "비꼼/조롱/반어 표현이 감지되어 중립이 아니라 부정 심리로 분류.",
+            "score": -0.9,
+            "confidence": 0.9,
+            "reason": "웃음/비꼼/조롱성 표현은 투자심리 악화로 판단.",
         }
 
-    if has_emphasis_negative or negative_hits > positive_hits:
-        return {
-            "sentiment": "부정",
-            "sentiment_code": "bearish",
-            "score": -1.0,
-            "confidence": min(0.95, 0.72 + negative_hits * 0.08),
-            "reason": "하락·불안·악재성 표현이 우세함.",
-        }
-
-    if positive_hits > negative_hits:
+    if has_target_price_up or has_buy_or_hold or has_upward_phrase or (positive_hits >= 1 and positive_hits >= negative_hits):
+        confidence = min(0.95, 0.78 + positive_hits * 0.05)
         return {
             "sentiment": "긍정",
             "sentiment_code": "bullish",
             "score": 1.0,
-            "confidence": min(0.95, 0.72 + positive_hits * 0.08),
-            "reason": "상승·호재·기대성 표현이 우세함.",
+            "confidence": confidence,
+            "reason": "상승 기대·목표가·매수/보유 의지 표현이 감지됨.",
         }
 
-    # 종목/시장과 직접 관련 없는 정치·사회 이슈는 중립으로 두되 신뢰도는 낮게 둡니다.
-    if offtopic_hits > 0 and factual_hits == 0:
+    if negative_hits >= 1 or has_downward_phrase or has_question or has_doubt or has_complaint:
+        confidence = min(0.95, 0.76 + negative_hits * 0.05)
         return {
-            "sentiment": "불확실",
-            "sentiment_code": "uncertain",
-            "score": -0.2,
-            "confidence": 0.55,
-            "reason": "종목 감성과 직접 연결하기 어려운 비시장성 주제.",
+            "sentiment": "부정",
+            "sentiment_code": "bearish",
+            "score": -1.0,
+            "confidence": confidence,
+            "reason": "우려·불만·의심·하락성 표현이 감지되어 부정으로 판단.",
         }
 
-    # 단순 시장 정보는 중립. 단, 의문/불확실 표현이 있으면 약한 부정으로 반영합니다.
-    if factual_hits > 0 and not has_question_or_doubt:
+    is_short_noise = len(text.replace(" ", "")) <= 8
+    if factual_hits >= 1 and offtopic_hits == 0 and not is_short_noise:
         return {
             "sentiment": "중립",
             "sentiment_code": "neutral",
             "score": 0.0,
-            "confidence": 0.72,
-            "reason": "시장 정보 공유에 가까운 정보성 문장.",
+            "confidence": 0.75,
+            "reason": "감정보다는 시장/수급/시황 정보 전달에 가까움.",
         }
 
-    if has_question_or_doubt:
+    if offtopic_hits >= 1:
         return {
-            "sentiment": "불확실",
-            "sentiment_code": "uncertain",
-            "score": -0.25,
-            "confidence": 0.62,
-            "reason": "확신이 낮거나 의문형 표현으로 약한 부정/불안 심리로 반영.",
+            "sentiment": "부정",
+            "sentiment_code": "noise_bearish",
+            "score": -0.6,
+            "confidence": 0.7,
+            "reason": "종목과 직접 관련 낮은 잡음성 글로 커뮤니티 심리 악화 요인.",
         }
 
     return {
-        "sentiment": "불확실",
-        "sentiment_code": "unknown",
-        "score": -0.1,
-        "confidence": 0.5,
-        "reason": "문장만으로 방향성 판단이 어려워 약한 보수값 적용.",
+        "sentiment": "부정",
+        "sentiment_code": "weak_bearish",
+        "score": -0.45,
+        "confidence": 0.65,
+        "reason": "명확한 긍정 근거가 없어 보수적으로 약한 부정 처리.",
     }
 
 
@@ -371,10 +375,7 @@ def extract_keywords(posts_df: pd.DataFrame, sentiment_label: str, vocabulary: l
     if posts_df.empty or "sentiment" not in posts_df.columns:
         return {}
 
-    if sentiment_label == "부정":
-        filtered = posts_df[posts_df["sentiment"].isin(["부정", "불확실"])]
-    else:
-        filtered = posts_df[posts_df["sentiment"] == sentiment_label]
+    filtered = posts_df[posts_df["sentiment"] == sentiment_label]
 
     result: dict[str, int] = {}
 
@@ -416,7 +417,7 @@ def build_stock_summary(
 
     message_volume = len(df)
     bullish_ratio = round((df["sentiment"] == "긍정").mean() * 100)
-    bearish_ratio = round(df["sentiment"].isin(["부정", "불확실"]).mean() * 100)
+    bearish_ratio = round((df["sentiment"] == "부정").mean() * 100)
     neutral_ratio = max(0, 100 - bullish_ratio - bearish_ratio)
 
     avg_views = df["views"].mean() if message_volume else 0
@@ -530,7 +531,7 @@ with st.sidebar:
 
     st.divider()
     st.caption("여러 페이지 수집으로 표본을 늘렸습니다.")
-    st.caption("감성은 중립을 줄이고, 반어/조롱은 부정 계열로 처리합니다.")
+    st.caption("감성은 불확실 라벨을 제거하고, 애매한 투자자 심리는 약한 부정으로 엄격 처리합니다.")
 
 # ------------------------------------------------------------
 # 5) Data loading
@@ -585,7 +586,7 @@ with header_right:
 st.divider()
 
 metric_cols = st.columns(4)
-metric_cols[0].metric("긍정 비율", f"{stock['bullish_ratio']}%", f"부정/불확실 {stock['bearish_ratio']}%")
+metric_cols[0].metric("긍정 비율", f"{stock['bullish_ratio']}%", f"부정 {stock['bearish_ratio']}%")
 metric_cols[1].metric("게시글 수", f"{stock['message_volume']:,}", f"{page_count}페이지 기준" if data_source == "live" else "mock 기준")
 metric_cols[2].metric("과열도", f"{stock['hype_index']}", "글 수·조회수·추천수")
 metric_cols[3].metric("감성 점수", f"{stock['sentiment_score']:+.2f}", "-1 ~ +1")
@@ -634,7 +635,7 @@ with sentiment_col:
     st.subheader("감성 비율")
     ratio_df = pd.DataFrame(
         {
-            "sentiment": ["긍정", "부정/불확실", "중립"],
+            "sentiment": ["긍정", "부정", "중립"],
             "ratio": [
                 stock["bullish_ratio"],
                 stock["bearish_ratio"],
@@ -681,7 +682,7 @@ with keyword_col_1:
     render_keyword_chips(stock["positive_keywords"])
 
 with keyword_col_2:
-    st.subheader("👎 부정/반어 키워드")
+    st.subheader("👎 부정 키워드")
     render_keyword_chips(stock["negative_keywords"])
 
 st.divider()
