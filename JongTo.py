@@ -747,12 +747,31 @@ stock_name = find_stock_name(stock_code)
 data_source = "mock"
 load_error = None
 
+live_warnings: list[str] = []
+
 try:
     if use_live_data:
-        with st.spinner("네이버 종목토론방과 주가 데이터를 수집하는 중입니다..."):
+        with st.spinner("네이버 종목토론방 데이터를 수집하는 중입니다..."):
+            # 게시글 수집이 핵심입니다. 게시글만 성공하면 live 데이터로 표시합니다.
             live_posts_df = fetch_naver_board_pages(stock_code, page_count=page_count)
-            price_info = fetch_naver_price_info(stock_code)
-            history_df = fetch_naver_daily_prices(stock_code, count=chart_days)
+
+            if live_posts_df.empty:
+                raise ValueError("네이버 종목토론방에서 게시글을 찾지 못했습니다. 종목코드 또는 네이버 응답 구조를 확인하세요.")
+
+            try:
+                price_info = fetch_naver_price_info(stock_code)
+            except Exception as price_exc:
+                price_info = {"price": "-", "change": "-"}
+                live_warnings.append(f"현재가 수집 실패: {price_exc}")
+
+            try:
+                history_df = fetch_naver_daily_prices(stock_code, count=chart_days)
+                if history_df.empty:
+                    live_warnings.append("주가 차트 데이터가 비어 있습니다.")
+            except Exception as chart_exc:
+                history_df = pd.DataFrame()
+                live_warnings.append(f"주가 차트 수집 실패: {chart_exc}")
+
             stock = build_stock_summary(
                 stock_code=stock_code,
                 stock_name=stock_name,
@@ -793,9 +812,15 @@ st.title("📈 종목토론방 실시간 여론 대시보드")
 st.caption("네이버 종목토론방 게시글과 주가 흐름을 함께 보며 커뮤니티 감성지수와 과열도를 추정합니다.")
 
 if data_source == "live":
-    st.success(f"실제 네이버 데이터를 수집했습니다. 수집 범위: 1~{page_count}페이지 · 수집 글 수: {stock['message_volume']:,}개")
+    st.success(f"실제 네이버 게시글 데이터를 수집했습니다. 수집 범위: 1~{page_count}페이지 · 수집 글 수: {stock['message_volume']:,}개")
+    if live_warnings:
+        with st.expander("일부 데이터 수집 경고 보기"):
+            for warning in live_warnings:
+                st.warning(warning)
 elif load_error:
-    st.warning(f"실제 데이터 수집에 실패해 mock 데이터로 표시합니다. 오류: {load_error}")
+    st.error("실제 네이버 게시글 수집에 실패해 mock 데이터로 표시합니다.")
+    st.code(load_error, language="text")
+    st.info("Render 서버 IP가 네이버 금융에 의해 차단되거나, 네이버 페이지 구조가 바뀌었거나, 종목코드가 잘못된 경우 발생할 수 있습니다.")
 else:
     st.info("mock 데이터로 표시 중입니다.")
 
