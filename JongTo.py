@@ -12,11 +12,13 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+
 st.set_page_config(
     page_title="종목토론방 감성 대시보드",
     page_icon="📈",
     layout="wide",
 )
+
 
 # ============================================================
 # 1) 기본 설정
@@ -25,9 +27,10 @@ st.set_page_config(
 NAVER_BOARD_URL = "https://finance.naver.com/item/board.naver"
 NAVER_MAIN_URL = "https://finance.naver.com/item/main.naver"
 NAVER_CHART_URL = "https://fchart.stock.naver.com/sise.nhn"
+NAVER_DAILY_PRICE_URL = "https://finance.naver.com/item/sise_day.naver"
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MarketSentimentMVP/0.4)",
+    "User-Agent": "Mozilla/5.0 (compatible; MarketSentimentMVP/0.5)",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
@@ -42,7 +45,6 @@ STOCK_PRESETS = {
     "373220": "LG에너지솔루션",
 }
 
-# 긍정/부정 단어는 계속 보강할 수 있습니다.
 POSITIVE_WORDS = [
     "상한가", "급등", "간다", "가즈아", "매수", "호재", "돌파", "신고가", "반등", "대박",
     "상승", "불장", "기대", "저평가", "수급", "실적", "목표가", "외국인", "기관", "강세",
@@ -50,7 +52,7 @@ POSITIVE_WORDS = [
     "역대급", "최고가", "신기록", "어닝", "서프라이즈", "개선", "턴어라운드", "바닥", "저점",
     "날라", "날아", "불기둥", "양봉", "쏜다", "오를", "오른", "올라", "상방", "우상향",
     "100만전자", "10만전자", "20만닉스", "엔비디아", "ai", "hbm", "반도체", "탑승", "존버", "추매",
-    "공급", "승인", "수주", "개발", "증설", "수혜", "랠리", "대장", "주도주", "매집",
+    "공급", "승인", "개발", "증설", "대장", "주도주", "매집",
 ]
 
 NEGATIVE_WORDS = [
@@ -85,31 +87,74 @@ STOPWORDS = {
     "ㅋㅋ", "ㅎㅎ", "ㅠㅠ", "ㅜㅜ", "이제", "여기", "그거", "이거", "저거", "대한", "때문",
 }
 
+
+# ============================================================
+# 2) Mock 데이터
+# ============================================================
+
 MOCK_HISTORY = pd.DataFrame(
     {
         "date": pd.date_range(end=pd.Timestamp.today(), periods=90),
         "close": [70000 + i * 30 + int(math.sin(i / 5) * 1500) for i in range(90)],
+        "volume": [1000000 + int(math.sin(i / 7) * 200000) for i in range(90)],
     }
 )
 MOCK_HISTORY["ma5"] = MOCK_HISTORY["close"].rolling(5).mean()
 MOCK_HISTORY["ma20"] = MOCK_HISTORY["close"].rolling(20).mean()
 MOCK_HISTORY["ma60"] = MOCK_HISTORY["close"].rolling(60).mean()
+MOCK_HISTORY["volume_ma20"] = MOCK_HISTORY["volume"].rolling(20).mean()
 
 MOCK_POSTS = pd.DataFrame(
     [
-        {"date": "-", "title": "외국인 다시 들어오는 분위기네요", "author": "-", "views": 482, "likes": 11, "dislikes": 2, "url": "", "source_page": 1},
-        {"date": "-", "title": "오늘 거래량 보면 단기 반등 가능성 있음", "author": "-", "views": 331, "likes": 8, "dislikes": 1, "url": "", "source_page": 1},
-        {"date": "-", "title": "또 박스권이면 힘들다", "author": "-", "views": 298, "likes": 4, "dislikes": 7, "url": "", "source_page": 1},
-        {"date": "-", "title": "휴먼 인덱스 최고조 상태 ㅋㅋ", "author": "-", "views": 211, "likes": 2, "dislikes": 1, "url": "", "source_page": 1},
+        {
+            "date": "-",
+            "title": "외국인 다시 들어오는 분위기네요",
+            "author": "-",
+            "views": 482,
+            "likes": 11,
+            "dislikes": 2,
+            "url": "",
+            "source_page": 1,
+        },
+        {
+            "date": "-",
+            "title": "오늘 거래량 보면 단기 반등 가능성 있음",
+            "author": "-",
+            "views": 331,
+            "likes": 8,
+            "dislikes": 1,
+            "url": "",
+            "source_page": 1,
+        },
+        {
+            "date": "-",
+            "title": "또 박스권이면 힘들다",
+            "author": "-",
+            "views": 298,
+            "likes": 4,
+            "dislikes": 7,
+            "url": "",
+            "source_page": 1,
+        },
+        {
+            "date": "-",
+            "title": "휴먼 인덱스 최고조 상태 ㅋㅋ",
+            "author": "-",
+            "views": 211,
+            "likes": 2,
+            "dislikes": 1,
+            "url": "",
+            "source_page": 1,
+        },
     ]
 )
 
+
 # ============================================================
-# 2) 네이버 수집 유틸
+# 3) 네이버 수집 유틸
 # ============================================================
 
 def decode_naver_response(response: requests.Response) -> str:
-    """네이버 금융 페이지 한글 깨짐 방지용 디코더."""
     for encoding in ("cp949", "euc-kr", "utf-8"):
         try:
             return response.content.decode(encoding)
@@ -132,11 +177,6 @@ def clean_title(title: str) -> str:
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_naver_board_pages(stock_code: str, page_count: int = 10, delay_sec: float = 0.12) -> pd.DataFrame:
-    """네이버 종목토론방 여러 페이지의 글 목록을 수집합니다.
-
-    source_page 컬럼은 해당 글이 몇 페이지에서 수집됐는지 뜻합니다.
-    예: source_page=4는 4페이지 글이라는 의미입니다.
-    """
     rows: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
 
@@ -148,6 +188,7 @@ def fetch_naver_board_pages(stock_code: str, page_count: int = 10, delay_sec: fl
             timeout=10,
         )
         response.raise_for_status()
+
         html = decode_naver_response(response)
         soup = BeautifulSoup(html, "html.parser")
 
@@ -204,6 +245,7 @@ def fetch_naver_price_info(stock_code: str) -> dict[str, str]:
         timeout=10,
     )
     response.raise_for_status()
+
     html = decode_naver_response(response)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -224,7 +266,7 @@ def fetch_naver_price_info(stock_code: str) -> dict[str, str]:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
+def fetch_naver_daily_prices_from_fchart(stock_code: str, count: int = 90) -> pd.DataFrame:
     response = requests.get(
         NAVER_CHART_URL,
         params={
@@ -239,6 +281,7 @@ def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
     response.raise_for_status()
 
     rows: list[dict[str, Any]] = []
+
     root = ET.fromstring(response.content)
 
     for item in root.iter("item"):
@@ -246,6 +289,7 @@ def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
         parts = raw.split("|")
         if len(parts) < 6:
             continue
+
         date_raw, open_price, high, low, close, volume = parts[:6]
         rows.append(
             {
@@ -258,25 +302,98 @@ def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
             }
         )
 
-    df = pd.DataFrame(rows).dropna(subset=["date"])
-    df = df.sort_values("date")
+    return pd.DataFrame(rows).dropna(subset=["date"])
 
-    if not df.empty:
-        df["ma5"] = df["close"].rolling(window=5).mean()
-        df["ma20"] = df["close"].rolling(window=20).mean()
-        df["ma60"] = df["close"].rolling(window=60).mean()
-        df["volume_ma20"] = df["volume"].rolling(window=20).mean()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_naver_daily_prices_from_table(stock_code: str, count: int = 90) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    max_pages = max(1, math.ceil(count / 10) + 1)
+
+    for page in range(1, max_pages + 1):
+        response = requests.get(
+            NAVER_DAILY_PRICE_URL,
+            params={"code": stock_code, "page": page},
+            headers=REQUEST_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        html = decode_naver_response(response)
+        soup = BeautifulSoup(html, "html.parser")
+
+        for tr in soup.select("table.type2 tr"):
+            cols = [td.get_text(" ", strip=True) for td in tr.select("td")]
+
+            if len(cols) < 7:
+                continue
+
+            date_text, close, diff, open_price, high, low, volume = cols[:7]
+
+            if not re.match(r"^\d{4}\.\d{2}\.\d{2}$", date_text):
+                continue
+
+            rows.append(
+                {
+                    "date": pd.to_datetime(date_text, format="%Y.%m.%d", errors="coerce"),
+                    "open": to_int(open_price),
+                    "high": to_int(high),
+                    "low": to_int(low),
+                    "close": to_int(close),
+                    "volume": to_int(volume),
+                }
+            )
+
+            if len(rows) >= count:
+                break
+
+        if len(rows) >= count:
+            break
+
+        time.sleep(0.08)
+
+    return pd.DataFrame(rows).dropna(subset=["date"])
+
+
+def add_moving_averages(price_df: pd.DataFrame) -> pd.DataFrame:
+    if price_df.empty:
+        return price_df
+
+    df = price_df.drop_duplicates(subset=["date"]).sort_values("date").copy()
+    df["ma5"] = df["close"].rolling(window=5).mean()
+    df["ma20"] = df["close"].rolling(window=20).mean()
+    df["ma60"] = df["close"].rolling(window=60).mean()
+    df["volume_ma20"] = df["volume"].rolling(window=20).mean()
 
     return df
 
-# ============================================================
-# 3) 감성 분석: 룰 기반 + 선택적 LLM
-# ============================================================
 
-def has_any(text: str, words: list[str]) -> bool:
-    lowered = text.lower()
-    return any(word.lower() in lowered for word in words)
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_naver_daily_prices(stock_code: str, count: int = 90) -> pd.DataFrame:
+    errors: list[str] = []
 
+    try:
+        df = fetch_naver_daily_prices_from_fchart(stock_code, count=count)
+        if not df.empty:
+            return add_moving_averages(df)
+        errors.append("fchart XML 응답은 성공했지만 데이터가 비어 있습니다.")
+    except Exception as exc:
+        errors.append(f"fchart XML 실패: {exc}")
+
+    try:
+        df = fetch_naver_daily_prices_from_table(stock_code, count=count)
+        if not df.empty:
+            return add_moving_averages(df)
+        errors.append("일별시세 표 응답은 성공했지만 데이터가 비어 있습니다.")
+    except Exception as exc:
+        errors.append(f"일별시세 표 실패: {exc}")
+
+    raise RuntimeError(" / ".join(errors))
+
+
+# ============================================================
+# 4) 감성 분석
+# ============================================================
 
 def count_hits(text: str, words: list[str]) -> int:
     lowered = text.lower()
@@ -284,10 +401,6 @@ def count_hits(text: str, words: list[str]) -> int:
 
 
 def classify_sentiment_rule(title: str, stock_name: str) -> dict[str, Any]:
-    """제목을 해당 종목 관점에서 긍정/부정/중립으로 분류합니다.
-
-    내부 코드는 더 세분화하지만 화면 라벨은 긍정/부정/중립만 사용합니다.
-    """
     text = str(title).strip()
 
     positive_hits = count_hits(text, POSITIVE_WORDS)
@@ -327,7 +440,6 @@ def classify_sentiment_rule(title: str, stock_name: str) -> dict[str, Any]:
     if sarcasm_hits >= 1 or has_laughter:
         negative_score += 1.5
 
-    # 상승 키워드 + 웃음은 단순 흥분일 수 있어 바로 부정 처리하지 않습니다.
     if (sarcasm_hits >= 1 or has_laughter) and negative_score > positive_score + 2.0:
         return {
             "sentiment": "부정",
@@ -400,7 +512,6 @@ def classify_sentiment_rule(title: str, stock_name: str) -> dict[str, Any]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def classify_sentiment_llm_cached(title: str, stock_name: str, model_name: str) -> dict[str, Any]:
-    """선택적 LLM 분류. OPENAI_API_KEY와 openai 패키지가 있을 때만 사용됩니다."""
     try:
         from openai import OpenAI
     except Exception:
@@ -416,7 +527,6 @@ def classify_sentiment_llm_cached(title: str, stock_name: str, model_name: str) 
 너는 한국 주식 커뮤니티 문장을 해당 종목 관점에서 분류하는 감성 분석기다.
 반드시 JSON만 출력한다.
 라벨은 bullish, bearish, neutral 중 하나다.
-판단 기준:
 - 해당 종목 주가, 실적, 수급, 기대감에 긍정적이면 bullish.
 - 하락 우려, 손절, 고점 경계, 악재, 조롱, 비꼼, 불만이면 bearish.
 - 단순 시황/정보/정치/잡담/종목과 무관한 글이면 neutral.
@@ -447,6 +557,7 @@ def classify_sentiment_llm_cached(title: str, stock_name: str, model_name: str) 
             temperature=0,
             response_format={"type": "json_object"},
         )
+
         parsed = json.loads(response.choices[0].message.content)
 
         label = str(parsed.get("label", "neutral")).lower()
@@ -473,6 +584,7 @@ def classify_sentiment_llm_cached(title: str, stock_name: str, model_name: str) 
             "reason": reason,
             "is_noise": is_noise,
         }
+
     except Exception:
         return classify_sentiment_rule(title, stock_name)
 
@@ -482,8 +594,9 @@ def classify_title(title: str, stock_name: str, mode: str, model_name: str) -> d
         return classify_sentiment_llm_cached(title, stock_name, model_name)
     return classify_sentiment_rule(title, stock_name)
 
+
 # ============================================================
-# 4) 집계/키워드/해석
+# 5) 집계/키워드
 # ============================================================
 
 def extract_keywords(posts_df: pd.DataFrame, sentiment_label: str, vocabulary: list[str]) -> dict[str, int]:
@@ -504,7 +617,6 @@ def extract_keywords(posts_df: pd.DataFrame, sentiment_label: str, vocabulary: l
 
 
 def extract_frequent_terms(posts_df: pd.DataFrame, top_n: int = 50) -> dict[str, int]:
-    """감성과 무관하게 전체 게시글 제목에서 빈출 어휘를 추출합니다."""
     if posts_df.empty or "title" not in posts_df.columns:
         return {}
 
@@ -512,6 +624,7 @@ def extract_frequent_terms(posts_df: pd.DataFrame, top_n: int = 50) -> dict[str,
     titles = " ".join(posts_df["title"].astype(str).tolist()).lower()
 
     tokens = re.findall(r"[가-힣a-zA-Z0-9]{2,}", titles)
+
     for token in tokens:
         token = token.strip().lower()
         if len(token) < 2 or token in STOPWORDS:
@@ -521,12 +634,15 @@ def extract_frequent_terms(posts_df: pd.DataFrame, top_n: int = 50) -> dict[str,
         counter[token] = counter.get(token, 0) + 1
 
     domain_terms = POSITIVE_WORDS + NEGATIVE_WORDS + SARCASM_HINTS + FACTUAL_MARKET_HINTS
+
     for word in domain_terms:
         if len(word) < 2:
             continue
+
         normalized = word.lower()
         if normalized in STOPWORDS:
             continue
+
         count = titles.count(normalized)
         if count > 0:
             counter[word] = counter.get(word, 0) + count * 2
@@ -547,17 +663,21 @@ def build_stock_summary(
         raise ValueError("수집된 게시글이 없습니다.")
 
     df = posts_df.copy().reset_index(drop=True)
-    details = df["title"].apply(lambda title: classify_title(title, stock_name, classification_mode, llm_model_name))
+
+    details = df["title"].apply(
+        lambda title: classify_title(title, stock_name, classification_mode, llm_model_name)
+    )
+
     detail_df = pd.DataFrame(details.tolist())
     df = pd.concat([df, detail_df], axis=1)
 
-    # noise는 감성 점수 가중치를 낮춥니다.
     df["base_weight"] = (
         1
         + df["views"].fillna(0).apply(lambda x: math.log1p(max(int(x), 0)))
         + df["likes"].fillna(0) * 0.10
         - df["dislikes"].fillna(0) * 0.04
     ).clip(lower=0.2)
+
     df["noise_weight"] = df["is_noise"].apply(lambda value: 0.25 if value else 1.0)
     df["weight"] = df["base_weight"] * df["confidence"].fillna(0.6) * df["noise_weight"]
 
@@ -572,14 +692,33 @@ def build_stock_summary(
     avg_views = float(df["views"].mean()) if message_volume else 0
     total_engagement = int(df["likes"].sum() + df["dislikes"].sum())
     sentiment_polarization = abs(bullish_ratio - bearish_ratio)
-    hype_index = min(100, round(message_volume * 1.1 + math.log1p(avg_views) * 7 + total_engagement * 0.18 + sentiment_polarization * 0.18))
+
+    hype_index = min(
+        100,
+        round(
+            message_volume * 1.1
+            + math.log1p(avg_views) * 7
+            + total_engagement * 0.18
+            + sentiment_polarization * 0.18
+        ),
+    )
 
     price_info = price_info or {"price": "-", "change": "-"}
 
     posts = df[
         [
-            "title", "sentiment", "sentiment_code", "confidence", "reason", "is_noise",
-            "views", "likes", "dislikes", "date", "source_page", "url",
+            "title",
+            "sentiment",
+            "sentiment_code",
+            "confidence",
+            "reason",
+            "is_noise",
+            "views",
+            "likes",
+            "dislikes",
+            "date",
+            "source_page",
+            "url",
         ]
     ].to_dict("records")
 
@@ -620,6 +759,7 @@ def build_market_interpretation(stock: dict[str, Any]) -> str:
     history_df = stock.get("history_df", pd.DataFrame())
 
     price_context = "주가 흐름 데이터가 부족합니다."
+
     if isinstance(history_df, pd.DataFrame) and not history_df.empty:
         latest = history_df.iloc[-1]
         close = latest.get("close")
@@ -639,20 +779,21 @@ def build_market_interpretation(stock: dict[str, Any]) -> str:
                 price_context += " 60일선 아래라 중기 흐름은 약한 편입니다."
 
     if score >= 0.25 and hype >= 70:
-        sentiment_context = "커뮤니티 감성은 긍정 쪽으로 강하게 쏠려 있고 관심도도 높습니다. 추세 기대감 또는 과열 가능성을 함께 봐야 합니다."
+        sentiment_context = "커뮤니티 감성은 긍정 쪽으로 강하게 쏠려 있고 관심도도 높습니다."
     elif score >= 0.25:
-        sentiment_context = "커뮤니티 감성은 긍정 우세입니다. 상승 기대 또는 저점 매수 심리가 나타납니다."
+        sentiment_context = "커뮤니티 감성은 긍정 우세입니다."
     elif score <= -0.25 and hype >= 70:
-        sentiment_context = "커뮤니티 감성은 부정 우세이며 관심도도 높습니다. 악재, 고점 경계, 불안 심리가 확산되는 구간일 수 있습니다."
+        sentiment_context = "커뮤니티 감성은 부정 우세이며 관심도도 높습니다."
     elif score <= -0.25:
-        sentiment_context = "커뮤니티 감성은 부정 우세입니다. 우려, 불만, 하락 경계성 글이 상대적으로 많습니다."
+        sentiment_context = "커뮤니티 감성은 부정 우세입니다."
     else:
-        sentiment_context = "커뮤니티 감성은 혼조입니다. 긍정/부정이 뚜렷하게 한쪽으로 쏠리지는 않았습니다."
+        sentiment_context = "커뮤니티 감성은 혼조입니다."
 
     return f"{sentiment_context} 긍정 {bullish}%, 부정 {bearish}%입니다. {price_context}"
 
+
 # ============================================================
-# 5) 화면 렌더링 유틸
+# 6) 화면 유틸
 # ============================================================
 
 def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
@@ -661,9 +802,12 @@ def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
         return
 
     max_weight = max(keyword_dict.values())
+
     html = "<div style='display:flex;flex-wrap:wrap;gap:8px;line-height:1.8;'>"
+
     for word, weight in sorted(keyword_dict.items(), key=lambda x: x[1], reverse=True):
         size = 13 + math.floor((weight / max_weight) * 11)
+
         html += (
             f"<span style='font-size:{size}px;"
             "background:#f1f5f9;"
@@ -674,13 +818,16 @@ def render_keyword_chips(keyword_dict: dict[str, int]) -> None:
             f"#{word}"
             "</span>"
         )
+
     html += "</div>"
+
     st.markdown(html, unsafe_allow_html=True)
 
 
 def keyword_dataframe(keyword_dict: dict[str, int], keyword_type: str) -> pd.DataFrame:
     if not keyword_dict:
         return pd.DataFrame(columns=["keyword", "weight", "type"])
+
     return pd.DataFrame(
         [{"keyword": key, "weight": value, "type": keyword_type} for key, value in keyword_dict.items()]
     ).sort_values("weight", ascending=False)
@@ -689,8 +836,9 @@ def keyword_dataframe(keyword_dict: dict[str, int], keyword_type: str) -> pd.Dat
 def find_stock_name(stock_code: str) -> str:
     return STOCK_PRESETS.get(stock_code, f"종목 {stock_code}")
 
+
 # ============================================================
-# 6) Sidebar
+# 7) Sidebar
 # ============================================================
 
 with st.sidebar:
@@ -717,7 +865,13 @@ with st.sidebar:
         help="1~N페이지를 실제로 수집합니다. 표의 수집 페이지는 해당 글의 출처 페이지입니다.",
     )
 
-    chart_days = st.slider("주가 추이 일수", min_value=30, max_value=240, value=90, step=30)
+    chart_days = st.slider(
+        "주가 추이 일수",
+        min_value=30,
+        max_value=240,
+        value=90,
+        step=30,
+    )
 
     classification_mode = st.radio(
         "감성 분류 방식",
@@ -728,7 +882,13 @@ with st.sidebar:
 
     llm_model_name = st.text_input("LLM 모델명", value="gpt-4o-mini")
 
-    display_rows = st.slider("표시할 게시글 수", min_value=20, max_value=200, value=80, step=20)
+    display_rows = st.slider(
+        "표시할 게시글 수",
+        min_value=20,
+        max_value=200,
+        value=80,
+        step=20,
+    )
 
     if st.button("새로고침", use_container_width=True):
         st.cache_data.clear()
@@ -738,25 +898,25 @@ with st.sidebar:
     st.caption("수집 페이지 수가 10이면 1~10페이지를 실제 수집합니다.")
     st.caption("source_page는 글이 발견된 네이버 종목토론방 페이지 번호입니다.")
 
+
 # ============================================================
-# 7) 데이터 로딩
+# 8) 데이터 로딩
 # ============================================================
 
 stock_code = re.sub(r"\D", "", stock_code_input)[:6] or "005930"
 stock_name = find_stock_name(stock_code)
+
 data_source = "mock"
 load_error = None
-
 live_warnings: list[str] = []
 
 try:
     if use_live_data:
         with st.spinner("네이버 종목토론방 데이터를 수집하는 중입니다..."):
-            # 게시글 수집이 핵심입니다. 게시글만 성공하면 live 데이터로 표시합니다.
             live_posts_df = fetch_naver_board_pages(stock_code, page_count=page_count)
 
             if live_posts_df.empty:
-                raise ValueError("네이버 종목토론방에서 게시글을 찾지 못했습니다. 종목코드 또는 네이버 응답 구조를 확인하세요.")
+                raise ValueError("네이버 종목토론방에서 게시글을 찾지 못했습니다.")
 
             try:
                 price_info = fetch_naver_price_info(stock_code)
@@ -782,6 +942,7 @@ try:
                 llm_model_name=llm_model_name,
             )
             data_source = "live"
+
     else:
         stock = build_stock_summary(
             stock_code="005930",
@@ -792,8 +953,10 @@ try:
             classification_mode="Rule",
             llm_model_name=llm_model_name,
         )
+
 except Exception as exc:
     load_error = str(exc)
+
     stock = build_stock_summary(
         stock_code="005930",
         stock_name="삼성전자",
@@ -804,23 +967,29 @@ except Exception as exc:
         llm_model_name=llm_model_name,
     )
 
+
 # ============================================================
-# 8) Main layout
+# 9) Main layout
 # ============================================================
 
 st.title("📈 종목토론방 실시간 여론 대시보드")
 st.caption("네이버 종목토론방 게시글과 주가 흐름을 함께 보며 커뮤니티 감성지수와 과열도를 추정합니다.")
 
 if data_source == "live":
-    st.success(f"실제 네이버 게시글 데이터를 수집했습니다. 수집 범위: 1~{page_count}페이지 · 수집 글 수: {stock['message_volume']:,}개")
+    st.success(
+        f"실제 네이버 게시글 데이터를 수집했습니다. "
+        f"수집 범위: 1~{page_count}페이지 · 수집 글 수: {stock['message_volume']:,}개"
+    )
+
     if live_warnings:
         with st.expander("일부 데이터 수집 경고 보기"):
             for warning in live_warnings:
                 st.warning(warning)
+
 elif load_error:
     st.error("실제 네이버 게시글 수집에 실패해 mock 데이터로 표시합니다.")
     st.code(load_error, language="text")
-    st.info("Render 서버 IP가 네이버 금융에 의해 차단되거나, 네이버 페이지 구조가 바뀌었거나, 종목코드가 잘못된 경우 발생할 수 있습니다.")
+    st.info("Render 서버 IP 차단, 네이버 페이지 구조 변경, 종목코드 오류 등이 원인일 수 있습니다.")
 else:
     st.info("mock 데이터로 표시 중입니다.")
 
@@ -831,10 +1000,15 @@ header_left, header_right = st.columns([2, 1])
 
 with header_left:
     st.subheader(f"{stock['name']} · {stock['code']}")
-    st.write(f"현재가 **{stock['price']}원** · 전일대비 **{stock['change']}** · 업데이트 **{stock['updated_at']}**")
+    st.write(
+        f"현재가 **{stock['price']}원** · "
+        f"전일대비 **{stock['change']}** · "
+        f"업데이트 **{stock['updated_at']}**"
+    )
 
 with header_right:
     label = get_sentiment_label(stock["sentiment_score"])
+
     st.metric(
         label="오늘의 감성 상태",
         value=label,
@@ -846,22 +1020,46 @@ st.info(build_market_interpretation(stock))
 st.divider()
 
 metric_cols = st.columns(4)
-metric_cols[0].metric("긍정 비율", f"{stock['bullish_ratio']}%", f"부정 {stock['bearish_ratio']}%")
-metric_cols[1].metric("게시글 수", f"{stock['message_volume']:,}", f"1~{page_count}페이지 기준" if data_source == "live" else "mock 기준")
-metric_cols[2].metric("과열도", f"{stock['hype_index']}", "글 수·조회수·추천수·쏠림")
-metric_cols[3].metric("감성 점수", f"{stock['sentiment_score']:+.2f}", "-1 부정 · 0 중립 · +1 긍정")
+
+metric_cols[0].metric(
+    "긍정 비율",
+    f"{stock['bullish_ratio']}%",
+    f"부정 {stock['bearish_ratio']}%",
+)
+
+metric_cols[1].metric(
+    "게시글 수",
+    f"{stock['message_volume']:,}",
+    f"1~{page_count}페이지 기준" if data_source == "live" else "mock 기준",
+)
+
+metric_cols[2].metric(
+    "과열도",
+    f"{stock['hype_index']}",
+    "글 수·조회수·추천수·쏠림",
+)
+
+metric_cols[3].metric(
+    "감성 점수",
+    f"{stock['sentiment_score']:+.2f}",
+    "-1 부정 · 0 중립 · +1 긍정",
+)
+
 
 # ============================================================
-# 9) Charts
+# 10) Charts
 # ============================================================
 
 price_col, sentiment_col = st.columns([1.4, 1])
 
 with price_col:
     st.subheader("주가 흐름 추이 + 이동평균선")
+
     history_df = stock.get("history_df", pd.DataFrame())
+
     if isinstance(history_df, pd.DataFrame) and not history_df.empty:
         available_columns = [col for col in ["close", "ma5", "ma20", "ma60"] if col in history_df.columns]
+
         price_chart_df = history_df.set_index("date")[available_columns].rename(
             columns={
                 "close": "종가",
@@ -870,13 +1068,16 @@ with price_col:
                 "ma60": "60일선",
             }
         )
+
         st.line_chart(price_chart_df, use_container_width=True)
 
         latest = history_df.iloc[-1]
         first = history_df.iloc[0]
+
         period_return = 0.0 if first["close"] == 0 else (latest["close"] / first["close"] - 1) * 100
 
         ma_caption_parts = []
+
         for key, label_name in [("ma5", "5일선"), ("ma20", "20일선"), ("ma60", "60일선")]:
             if key in latest and pd.notna(latest[key]):
                 ma_caption_parts.append(f"{label_name} {int(latest[key]):,}원")
@@ -885,23 +1086,32 @@ with price_col:
             f"기간 수익률: {period_return:+.2f}% · 최근 종가: {int(latest['close']):,}원"
             + (" · " + " · ".join(ma_caption_parts) if ma_caption_parts else "")
         )
+
     else:
         st.caption("주가 추이 데이터를 불러오지 못했습니다.")
 
 with sentiment_col:
     st.subheader("감성 비율")
+
     ratio_df = pd.DataFrame(
         {
             "sentiment": ["긍정", "부정", "중립"],
-            "ratio": [stock["bullish_ratio"], stock["bearish_ratio"], stock["neutral_ratio"]],
+            "ratio": [
+                stock["bullish_ratio"],
+                stock["bearish_ratio"],
+                stock["neutral_ratio"],
+            ],
         }
     )
+
     st.bar_chart(ratio_df, x="sentiment", y="ratio")
+
 
 chart_col_1, chart_col_2 = st.columns([1, 1])
 
 with chart_col_1:
     st.subheader("키워드 가중치")
+
     keyword_df = pd.concat(
         [
             keyword_dataframe(stock["positive_keywords"], "긍정"),
@@ -910,11 +1120,14 @@ with chart_col_1:
         ],
         ignore_index=True,
     )
+
     st.dataframe(keyword_df, use_container_width=True, hide_index=True)
 
 with chart_col_2:
     st.subheader("분류 코드 분포")
+
     raw_df = stock.get("raw_posts_df", pd.DataFrame())
+
     if isinstance(raw_df, pd.DataFrame) and not raw_df.empty and "sentiment_code" in raw_df.columns:
         code_df = raw_df["sentiment_code"].value_counts().reset_index()
         code_df.columns = ["code", "count"]
@@ -922,8 +1135,9 @@ with chart_col_2:
     else:
         st.caption("분류 코드 데이터가 없습니다.")
 
+
 # ============================================================
-# 10) Word clouds
+# 11) Word clouds
 # ============================================================
 
 st.subheader("전체 빈출 어휘 워드클라우드")
@@ -942,15 +1156,18 @@ with keyword_col_2:
 
 st.divider()
 
+
 # ============================================================
-# 11) Posts table
+# 12) Posts table
 # ============================================================
 
 st.subheader("최근 대표 글 제목")
-st.caption(f"표의 수집 페이지는 해당 글이 발견된 네이버 종목토론방 페이지 번호입니다. 현재 화면은 최대 {display_rows}개 글을 보여줍니다.")
+st.caption(
+    f"표의 수집 페이지는 해당 글이 발견된 네이버 종목토론방 페이지 번호입니다. "
+    f"현재 화면은 최대 {display_rows}개 글을 보여줍니다."
+)
 
-posts_df = pd.DataFrame(stock["posts"])
-posts_df = posts_df.head(display_rows)
+posts_df = pd.DataFrame(stock["posts"]).head(display_rows)
 
 display_posts_df = posts_df.drop(columns=["url"], errors="ignore")
 
@@ -984,8 +1201,9 @@ st.warning(
     "투자 권유나 매매 신호가 아닙니다."
 )
 
+
 # ============================================================
-# 12) Guide
+# 13) Guide
 # ============================================================
 
 with st.expander("현재 MVP 구조와 고도화 방향"):
@@ -995,12 +1213,13 @@ with st.expander("현재 MVP 구조와 고도화 방향"):
 1. 네이버 종목토론방 1~N페이지 수집
 2. 한글 깨짐 방지: cp949/euc-kr 직접 디코딩
 3. 제목을 해당 종목 관점에서 긍정/부정/중립 분류
-   - 내부 코드: strong_bullish, weak_bullish, strong_bearish, weak_bearish, neutral_info, neutral_noise, neutral_chat
-   - 화면 라벨: 긍정/부정/중립
-   - 정치/잡담 noise는 감성 점수 가중치 낮춤
-4. 전체 빈출 어휘 + 긍정 키워드 + 부정 키워드 표시
-5. 네이버 일봉 차트에서 종가, 5/20/60일 이동평균선 표시
-6. 감성 점수와 이평선 위치를 결합한 자동 해석 문구 제공
+4. 정치/잡담 noise는 감성 점수 가중치 낮춤
+5. 전체 빈출 어휘 + 긍정 키워드 + 부정 키워드 표시
+6. 주가 데이터는 2단계 fallback
+   - 1차: fchart.stock.naver.com XML
+   - 2차: finance.naver.com/item/sise_day.naver 일별시세 표
+7. 종가, 5일선, 20일선, 60일선 표시
+8. 감성 점수와 이평선 위치를 결합한 자동 해석 문구 제공
 
 고도화 방향:
 - LLM 모드 사용: Render 환경변수에 OPENAI_API_KEY 추가
